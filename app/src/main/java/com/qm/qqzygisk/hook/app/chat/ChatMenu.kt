@@ -63,6 +63,9 @@ object ChatMenu {
     /**
      * 注册一个长按菜单项。首次调用时自动 hook QQ 的 setMenu。
      *
+     * 相同 (标题, 类型, 位置) 的重复注册视为同一项：更新回调与图标并保留原来的 itemId，
+     * 因此安装失败后重试不会产生重复菜单项。
+     *
      * @param title 菜单上显示的文字
      * @param type 消息内容类型，当前消息没有该内容则不插入
      * @param icon 菜单图标资源 id
@@ -77,35 +80,45 @@ object ChatMenu {
         position: ChatMenuPosition = ChatMenuPosition.Back,
         onClick: (Context, Any) -> Unit,
     ) {
-        entries += MenuEntry(title, type, icon, visible, position, onClick)
+        val previous = entries.firstOrNull { it.title == title && it.type == type && it.position == position }
+        val entry = MenuEntry(title, type, icon, visible, position, onClick, previous?.itemId ?: View.generateViewId())
+        if (previous == null) entries += entry else entries[entries.indexOf(previous)] = entry
         ensureHooked()
     }
 
+    /**
+     * 安装菜单 hook。只有安装成功才置位，宿主尚未就绪导致失败时保持未安装状态，
+     * 以便在更晚的宿主生命周期时机重试。
+     */
     private fun ensureHooked() {
-        if (!installed.compareAndSet(false, true)) return
+        if (installed.get()) return
+        synchronized(installed) {
+            if (installed.get()) return
 
-        val layoutClass = listOf(
-            "com.tencent.qqnt.aio.menu.ui.QQCustomMenuExpandableLayout",
-            "com.tencent.qqnt.aio.menu.ui.QQCustomMenuNoIconLayout",
-        ).firstNotNullOfOrNull { className ->
-            runCatching { Class.forName(className, false, appClassLoader) }.getOrNull()
-        } ?: error("未找到 QQ 聊天菜单布局类")
+            val layoutClass = listOf(
+                "com.tencent.qqnt.aio.menu.ui.QQCustomMenuExpandableLayout",
+                "com.tencent.qqnt.aio.menu.ui.QQCustomMenuNoIconLayout",
+            ).firstNotNullOfOrNull { className ->
+                runCatching { Class.forName(className, false, appClassLoader) }.getOrNull()
+            } ?: error("未找到 QQ 聊天菜单布局类")
 
-        val setMenuMethods = layoutClass.resolve().method {
-            name = "setMenu"
-        }
-        check(setMenuMethods.isNotEmpty()) { "未找到 QQ 聊天菜单 setMenu 方法" }
+            val setMenuMethods = layoutClass.resolve().method {
+                name = "setMenu"
+            }
+            check(setMenuMethods.isNotEmpty()) { "未找到 QQ 聊天菜单 setMenu 方法" }
 
-        setMenuMethods.hookAll {
-            before {
-                val layout = instance as? View ?: return@before
-                val menuContainer = args.getOrNull(0) ?: return@before
-                runCatching {
-                    insertItems(layout, menuContainer)
-                }.onFailure {
-                    Log.error("添加聊天菜单项失败", it)
+            setMenuMethods.hookAll {
+                before {
+                    val layout = instance as? View ?: return@before
+                    val menuContainer = args.getOrNull(0) ?: return@before
+                    runCatching {
+                        insertItems(layout, menuContainer)
+                    }.onFailure {
+                        Log.error("添加聊天菜单项失败", it)
+                    }
                 }
             }
+            installed.set(true)
         }
     }
 

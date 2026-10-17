@@ -27,6 +27,7 @@ internal object NtRepeater {
 
     fun repeat(
         msg: Any?,
+        session: AioSessionBinder.BoundSession?,
         onError: (String) -> Unit,
     ) {
         if (msg == null) {
@@ -37,7 +38,7 @@ internal object NtRepeater {
             onError("该消息不支持复读")
             return
         }
-        runCatching { repeatByForwardNt(msg, onError) }
+        runCatching { repeatByForwardNt(msg, session, onError) }
             .onFailure {
                 Log.error("repeat-plus failed", it)
                 onError("复读失败，请重试")
@@ -46,17 +47,17 @@ internal object NtRepeater {
 
     private fun repeatByForwardNt(
         msg: Any,
+        session: AioSessionBinder.BoundSession?,
         onError: (String) -> Unit,
     ) {
         val recordHint = msgRecord(msg)
-        val descriptor =
-            ChatImageSender.contactFromCurrentAioParam()
-                ?: contactFrom(recordHint)
-                ?: ChatImageSender.currentContactOrNull()
-        if (descriptor == null) {
+        // 优先用消息记录自带的会话信息；缺失时才用点击 View 绑定的当前会话。
+        val contact = contactFromRecord(recordHint) ?: sessionContact(session)
+        if (contact == null) {
             onError("没有可用的聊天会话，请重新进入聊天页面")
             return
         }
+        val chatType = chatTypeOf(contact)
         val msgId = msgIdOf(msg, recordHint)
         if (msgId == null || msgId == 0L) {
             onError("无法读取消息")
@@ -65,11 +66,6 @@ internal object NtRepeater {
         val service = NtMsgAccess.kernelMsgService()
         if (service == null) {
             onError("消息服务不可用")
-            return
-        }
-        val contact = NtMsgAccess.createContact(descriptor.chatType, descriptor.peerUid, descriptor.guildId)
-        if (contact == null) {
-            onError("没有可用的聊天会话，请重新进入聊天页面")
             return
         }
         val getMsgs = findMethod(service, "getMsgsByMsgId") { it.parameterCount == 3 }
@@ -98,7 +94,7 @@ internal object NtRepeater {
                             onError("消息获取失败，请重试")
                             return@callbackProxy
                         }
-                    dispatchRepeat(service, contact, dests, ids, attr, record, descriptor.chatType, onError)
+                    dispatchRepeat(service, contact, dests, ids, attr, record, chatType, onError)
                 },
             ),
         )
@@ -175,7 +171,8 @@ internal object NtRepeater {
         return out
     }
 
-    private fun contactFrom(record: Any?): ChatImageSender.ContactDescriptor? {
+    /** 从消息记录构造 native Contact；记录缺少会话字段时返回 null。 */
+    private fun contactFromRecord(record: Any?): Any? {
         if (record == null) return null
         val chatType = NtMsgAccess.asInt(NtMsgAccess.read(record, "getChatType", "chatType")) ?: return null
         val peerUid =
@@ -184,8 +181,16 @@ internal object NtRepeater {
                     NtMsgAccess.read(record, "getPeerUid", "peerUid", "getPeerUin", "peerUin"),
                 )?.takeIf { it.isNotBlank() } ?: return null
         val guildId = NtMsgAccess.asString(NtMsgAccess.read(record, "getGuildId", "guildId")).orEmpty()
-        return ChatImageSender.ContactDescriptor(chatType, peerUid, guildId)
+        return NtMsgAccess.createContact(chatType, peerUid, guildId)
     }
+
+    /** 点击 View 绑定的当前会话联系人；根不可见或聊天已切换时返回 null。 */
+    private fun sessionContact(session: AioSessionBinder.BoundSession?): Any? =
+        (session?.liveContact() as? AioSessionBinder.LiveContact.Ready)?.contact
+
+    private fun chatTypeOf(contact: Any): Int =
+        NtMsgAccess.asInt(NtMsgAccess.invokeNoArg(contact, "getChatType"))
+            ?: error("无法读取当前会话类型")
 
     private fun msgRecord(msg: Any): Any? {
         if (msg.javaClass.name.contains("MsgRecord")) return msg

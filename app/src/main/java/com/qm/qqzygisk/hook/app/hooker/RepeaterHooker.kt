@@ -15,7 +15,7 @@ import android.widget.Toast
 import com.qm.qqzygisk.R
 import com.qm.qqzygisk.hook.app.base.BaseHooker
 import com.qm.qqzygisk.hook.app.base.SettingData
-import com.qm.qqzygisk.hook.app.chat.ChatImageSender
+import com.qm.qqzygisk.hook.app.chat.AioSessionBinder
 import com.qm.qqzygisk.hook.app.chat.ChatMenu
 import com.qm.qqzygisk.hook.app.chat.ChatMenuPosition
 import com.qm.qqzygisk.hook.app.chat.ChatMenuType
@@ -102,8 +102,7 @@ object RepeaterHooker : BaseHooker() {
                 position = ChatMenuPosition.Front,
             ) { context, msg ->
                 if (isMultiForward(context)) return@addMenuItem
-                ChatImageSender.captureFromContext(context)
-                repeatMessage(msg, context)
+                repeatMessage(msg, context, AioSessionBinder.sessionFor(context))
             }
         }.onFailure {
             menuInstalled.set(false)
@@ -200,10 +199,7 @@ object RepeaterHooker : BaseHooker() {
         val msg = args[1]
         imageView.setOnClickListener { view ->
             if (!buttonEnabled) return@setOnClickListener
-            ChatImageSender.captureFromContext(view.context)
-            ChatImageSender.captureFrom(instance)
-            ChatImageSender.updateAioParamFrom(instance)
-            repeatMessage(msg, view.context)
+            repeatMessage(msg, view.context, AioSessionBinder.sessionFor(view))
         }
         imageView.visibility = View.VISIBLE
     }
@@ -250,12 +246,13 @@ object RepeaterHooker : BaseHooker() {
     private fun repeatMessage(
         msg: Any?,
         context: Context,
+        session: AioSessionBinder.BoundSession?,
     ) {
         if (!NtRepeater.isRepeatable(msg)) {
             toast(context, "该消息不支持复读")
             return
         }
-        NtRepeater.repeat(msg) { error -> toast(context, error) }
+        NtRepeater.repeat(msg, session) { error -> toast(context, error) }
     }
 
     private fun plusOneDrawable(context: Context): Drawable {

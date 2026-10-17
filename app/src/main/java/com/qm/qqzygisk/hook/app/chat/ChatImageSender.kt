@@ -1,94 +1,45 @@
 package com.qm.qqzygisk.hook.app.chat
 
-import android.app.Activity
-import android.content.Context
-import android.content.ContextWrapper
 import com.qm.qqzygisk.hook.app.data.HostData.appClassLoader
 import com.qm.qqzygisk.hook.utils.Log
 import java.io.File
-import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.reflect.Proxy
-import java.lang.ref.WeakReference
 import java.util.ArrayList
-import java.util.Collections
-import java.util.IdentityHashMap
 
-/** Sends local files to the QQNT conversation represented by the latest AIOParam. */
+/**
+ * 把本地文件作为图片/表情发送到 [AioSessionBinder.BoundSession] 绑定的聊天。
+ *
+ * 会话由调用方显式传入（长按时从被触摸的 View 解析，并记录当时的会话身份），这里不做任何
+ * “当前会话”全局缓存；发送前会重新解析并与面板打开时的身份比对，聊天已切换则明确失败，
+ * 因此切换聊天或复用 View 时不会把图片发到上一个会话，也不会静默发给新会话。
+ */
 object ChatImageSender {
-    private const val AIO_PARAM_CLASS = "com.tencent.aio.data.AIOParam"
-    private const val AIO_SESSION_CLASS = "com.tencent.aio.data.AIOSession"
-    private const val AIO_CONTACT_CLASS = "com.tencent.aio.data.AIOContact"
     private const val Q_ROUTE_CLASS = "com.tencent.mobileqq.qroute.QRoute"
     private const val MSG_UTIL_API_CLASS = "com.tencent.qqnt.msg.api.IMsgUtilApi"
     private const val MSG_SERVICE_CLASS = "com.tencent.qqnt.msg.api.IMsgService"
+
+    /** Contact.chatType == 4 为公会会话，据此选择公会版图片元素工厂。 */
+    private const val CHAT_TYPE_GUILD = 4
+
     enum class SendType(val subType: Int, val summary: String, val label: String) {
         IMAGE(0, "[图片]", "图片"),
         EMOTICON(1, "[动画表情]", "表情"),
-        ;
-
-        companion object {
-            fun fromName(raw: String): SendType =
-                entries.firstOrNull { it.name == raw } ?: IMAGE
-        }
-    }
-
-    @Volatile
-    private var currentAioParam: WeakReference<Any>? = null
-
-    @Volatile
-    private var lastContact: ContactDescriptor? = null
-
-    data class ContactDescriptor(
-        val chatType: Int,
-        val peerUid: String,
-        val guildId: String,
-    )
-
-    fun updateAioParam(value: Any?) {
-        if (value?.javaClass?.name != AIO_PARAM_CLASS) return
-        currentAioParam = WeakReference(value)
-        runCatching { lastContact = extractContact(value) }
-            .onFailure { Log.warn("缓存聊天会话失败", it) }
-    }
-
-    fun captureFrom(owner: Any?) {
-        if (owner == null) return
-        updateAioParam(owner)
-        updateAioParamFrom(owner)
-    }
-
-    fun captureFromContext(context: Context?) {
-        var current: Context? = context
-        while (current != null) {
-            if (current is Activity) {
-                captureFrom(current)
-                current.window?.decorView?.let(::captureFrom)
-                return
-            }
-            current = (current as? ContextWrapper)?.baseContext
-        }
-    }
-
-    fun currentContactOrNull(): ContactDescriptor? {
-        val live = currentAioParam?.get()
-        if (live != null) {
-            runCatching { return extractContact(live).also { lastContact = it } }
-                .onFailure { Log.warn("读取当前会话失败，将使用上次会话", it) }
-        }
-        return lastContact
-    }
-
-    fun contactFromCurrentAioParam(): ContactDescriptor? {
-        val aioParam = currentAioParam?.get() ?: return null
-        return runCatching { extractContact(aioParam) }.getOrNull()
     }
 
     /** 发送本地文件。默认按普通图片，type 可选表情。 */
-    fun sendImage(file: File, type: SendType = SendType.IMAGE): Result<Unit> = runCatching {
+    internal fun sendImage(
+        file: File,
+        type: SendType,
+        session: AioSessionBinder.BoundSession?,
+    ): Result<Unit> = runCatching {
         check(file.isFile && file.canRead()) { "图片文件不可用" }
-        val descriptor = resolveContact()
+        val contact = when (val live = session?.liveContact() ?: AioSessionBinder.LiveContact.Unavailable) {
+            is AioSessionBinder.LiveContact.Ready -> live.contact
+            is AioSessionBinder.LiveContact.Changed -> error("聊天会话已切换，请重新打开面板")
+            is AioSessionBinder.LiveContact.Unavailable -> error("没有可用的聊天会话，请重新进入聊天页面")
+        }
 
         val msgUtilType = loadClass(MSG_UTIL_API_CLASS)
         val msgUtil = qRouteApi(msgUtilType)
@@ -96,7 +47,7 @@ object ChatImageSender {
             msgUtilType,
             msgUtil,
             file,
-            isGuild = descriptor.chatType == 4,
+            isGuild = contactChatType(contact) == CHAT_TYPE_GUILD,
             subType = type.subType,
         )
         markPicKind(element, type)
@@ -104,7 +55,9 @@ object ChatImageSender {
         val msgServiceType = loadClass(MSG_SERVICE_CLASS)
         val msgService = qRouteApi(msgServiceType)
         val sendMethod = findSendMethod(msgServiceType, msgService)
-        val contact = createContact(sendMethod.parameterTypes[0], descriptor)
+        check(sendMethod.parameterTypes[0].isInstance(contact)) {
+            "QQ 会话类型不匹配: ${sendMethod.parameterTypes[0].name}"
+        }
         val callback = createCallback(sendMethod.parameterTypes[2], file)
 
         sendMethod.isAccessible = true
@@ -112,77 +65,19 @@ object ChatImageSender {
         Log.info("已提交聊天${type.label}发送: ${file.absolutePath}")
     }
 
-    /** Finds an AIOParam held by a QQ AIO component and makes it the active session. */
-    fun updateAioParamFrom(owner: Any): Any? {
-        val aioParamType = runCatching { loadClass(AIO_PARAM_CLASS) }.getOrNull() ?: return null
-        val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
-        var current = listOf(owner)
-        repeat(3) {
-            val next = ArrayList<Any>()
-            current.forEach { candidate ->
-                if (!visited.add(candidate)) return@forEach
-                if (aioParamType.isInstance(candidate)) {
-                    updateAioParam(candidate)
-                    return candidate
-                }
-                allFields(candidate.javaClass).forEach { field ->
-                    if (Modifier.isStatic(field.modifiers)) return@forEach
-                    val fieldType = field.type
-                    if (!aioParamType.isAssignableFrom(fieldType) && !isAioContainer(fieldType)) {
-                        return@forEach
-                    }
-                    val value = readField(field, candidate) ?: return@forEach
-                    if (aioParamType.isInstance(value)) {
-                        updateAioParam(value)
-                        return value
-                    }
-                    next.add(value)
-                }
-            }
-            current = next
-        }
-        return null
+    /** 会话类型取自 Contact 的稳定 getter（JNI ABI，非混淆目标）。 */
+    private fun contactChatType(contact: Any): Int {
+        val getter = contact.javaClass.methods
+            .firstOrNull { it.name == "getChatType" && it.parameterTypes.isEmpty() }
+            ?: error("QQ 联系人缺少 getChatType")
+        return (runCatching { getter.invoke(contact) }.getOrNull() as? Number)?.toInt()
+            ?: error("QQ 联系人会话类型不可用")
     }
 
-    private fun resolveContact(): ContactDescriptor {
-        val live = currentAioParam?.get()
-        if (live != null) {
-            runCatching { return extractContact(live).also { lastContact = it } }
-                .onFailure { Log.warn("读取当前会话失败，将使用上次会话", it) }
-        }
-        return lastContact ?: error("没有可用的聊天会话，请重新进入聊天页面")
-    }
-
-    private fun extractContact(aioParam: Any): ContactDescriptor {
-        val aioSession = readFieldByType(aioParam, loadClass(AIO_SESSION_CLASS))
-            ?: error("当前 AIOParam 中未找到 AIOSession")
-        val aioContact = readFieldByType(aioSession, loadClass(AIO_CONTACT_CLASS))
-            ?: error("当前 AIOSession 中未找到 AIOContact")
-
-        val chatTypeFromGetter = invokeNoArg(aioContact, "getChatType") as? Number
-        val namedChatField = listOf("d", "e")
-            .mapNotNull { name -> findField(aioContact.javaClass, name) }
-            .firstOrNull { it.type == Int::class.javaPrimitiveType }
-        val chatType = chatTypeFromGetter?.toInt()
-            ?: (namedChatField?.let { readField(it, aioContact) } as? Number)?.toInt()
-            ?: allFields(aioContact.javaClass)
-                .firstOrNull { it.type == Int::class.javaPrimitiveType }
-                ?.let { readField(it, aioContact) as? Number }
-                ?.toInt()
-            ?: error("无法读取当前会话类型")
-
-        val currentLayout = namedChatField?.name == "d"
-        val peerUid = (invokeNoArg(aioContact, "getPeerUid") as? String)
-            ?: readNamedString(aioContact, if (currentLayout) listOf("e", "f") else listOf("f", "e"))
-            ?: error("无法读取当前会话 UID")
-        val guildId = (invokeNoArg(aioContact, "getGuildId") as? String)
-            ?: readNamedString(aioContact, if (currentLayout) listOf("f", "g") else listOf("g"))
-            .orEmpty()
-
-        check(peerUid.isNotBlank()) { "当前会话 UID 为空" }
-        return ContactDescriptor(chatType, peerUid, guildId)
-    }
-
+    /**
+     * 图片元素工厂按稳定方法名选择：`createPicElement` / `createPicElementForGuild` 同为
+     * (String,boolean,int)，签名无法区分，因此不做签名猜测；公会工厂缺失时退回普通工厂。
+     */
     private fun createPicElement(
         apiType: Class<*>,
         api: Any,
@@ -224,20 +119,6 @@ object ChatImageSender {
                     types[2].isInterface
             }
             ?: error("QQ 图片发送接口不可用")
-    }
-
-    private fun createContact(type: Class<*>, descriptor: ContactDescriptor): Any {
-        val constructor = type.declaredConstructors.firstOrNull { candidate ->
-            candidate.parameterTypes.contentEquals(
-                arrayOf(Int::class.javaPrimitiveType!!, String::class.java, String::class.java),
-            )
-        } ?: error("QQ Contact 构造器不可用: ${type.name}")
-        constructor.isAccessible = true
-        return constructor.newInstance(
-            descriptor.chatType,
-            descriptor.peerUid,
-            descriptor.guildId,
-        )
     }
 
     private fun createCallback(type: Class<*>, file: File): Any {
@@ -282,17 +163,6 @@ object ChatImageSender {
         return method.invoke(null, apiType) ?: error("QRoute 未返回 ${apiType.name} 实例")
     }
 
-    private fun readFieldByType(target: Any, type: Class<*>): Any? =
-        allFields(target.javaClass)
-            .firstOrNull { type.isAssignableFrom(it.type) }
-            ?.let { readField(it, target) }
-
-    private fun readNamedString(target: Any, names: List<String>): String? =
-        names.asSequence()
-            .mapNotNull { findField(target.javaClass, it) }
-            .filter { it.type == String::class.java }
-            .firstNotNullOfOrNull { readField(it, target) as? String }
-
     private fun invokeNoArg(target: Any, name: String): Any? {
         val method = generateSequence(target.javaClass) { it.superclass }
             .flatMap { it.declaredMethods.asSequence() }
@@ -310,22 +180,6 @@ object ChatImageSender {
         method.isAccessible = true
         method.invoke(target, arg)
     }
-
-    private fun findField(type: Class<*>, name: String): Field? =
-        allFields(type).firstOrNull { it.name == name }
-
-    private fun readField(field: Field, target: Any): Any? = runCatching {
-        field.isAccessible = true
-        field.get(target)
-    }.getOrNull()
-
-    private fun allFields(type: Class<*>): Sequence<Field> =
-        generateSequence(type) { it.superclass }
-            .flatMap { it.declaredFields.asSequence() }
-
-    private fun isAioContainer(type: Class<*>): Boolean =
-        type.name.startsWith("com.tencent.aio.") ||
-            type.name.startsWith("com.tencent.mobileqq.aio.")
 
     private fun defaultValue(type: Class<*>): Any? = when (type) {
         Boolean::class.javaPrimitiveType -> false
