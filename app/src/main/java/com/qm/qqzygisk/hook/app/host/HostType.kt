@@ -6,7 +6,8 @@ internal enum class HostType(
     val enablePanelByDefault: Boolean,
 ) {
     QQ("com.tencent.mobileqq", "qq_zygisk_image_path", false),
-    WECHAT("com.tencent.mm", "wx_zygisk_image_path", true);
+    WECHAT("com.tencent.mm", "wx_zygisk_image_path", true),
+    DOUYIN("com.ss.android.ugc.aweme", "douyin_zygisk_image_path", true);
 
     companion object {
         fun fromPackageName(packageName: String?): HostType =

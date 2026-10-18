@@ -6,6 +6,18 @@ import org.junit.Test
 
 class ImageSourcePathsTest {
     @Test
+    fun `Douyin exposes the same three independent sources`() {
+        val defaults = HostImagePaths.defaults(HostType.DOUYIN)
+        assertEquals(3, defaults.scanRoots.size)
+        assertTrue(defaults.scanRoots.all { "/Android/media/com.ss.android.ugc.aweme/" in it })
+        assertEquals(defaults, HostImagePaths.resolve(HostType.DOUYIN, "", "", ""))
+        assertEquals(HostType.DOUYIN, HostType.fromPackageName("com.ss.android.ugc.aweme"))
+        assertNotEquals(HostType.QQ.imagePathKey, HostType.DOUYIN.imagePathKey)
+        assertNotEquals(HostType.WECHAT.imagePathKey, HostType.DOUYIN.imagePathKey)
+        assertTrue(HostType.DOUYIN.enablePanelByDefault)
+    }
+
+    @Test
     fun `QQ and WeChat both expose image FunBox and TG sources`() {
         for (isWeChat in listOf(false, true)) {
             val paths = HostImagePaths.defaults(isWeChat)

@@ -18,6 +18,9 @@ internal object HostImagePaths {
     const val WECHAT_IMAGES = "/storage/emulated/0/Android/media/com.tencent.mm/.qqzygisk"
     const val WECHAT_FUNBOX = "/storage/self/primary/Android/media/com.tencent.mm/.fun/Sticker/Storage"
     const val WECHAT_TG = "/storage/self/primary/Android/media/com.tencent.mm/TGStickersExported/v1"
+    const val DOUYIN_IMAGES = "/storage/emulated/0/Android/media/com.ss.android.ugc.aweme/.qqzygisk"
+    const val DOUYIN_FUNBOX = "/storage/self/primary/Android/media/com.ss.android.ugc.aweme/.fun/Sticker/Storage"
+    const val DOUYIN_TG = "/storage/self/primary/Android/media/com.ss.android.ugc.aweme/TGStickersExported/v1"
 
     fun resolve(isWeChat: Boolean, images: String, funBox: String, tgStickers: String): ImageSourcePaths =
         resolve(if (isWeChat) HostType.WECHAT else HostType.QQ, images, funBox, tgStickers)
@@ -43,5 +46,6 @@ internal object HostImagePaths {
     fun defaults(host: HostType): ImageSourcePaths = when (host) {
         HostType.QQ -> ImageSourcePaths(QQ_IMAGES, QQ_FUNBOX, QQ_TG)
         HostType.WECHAT -> ImageSourcePaths(WECHAT_IMAGES, WECHAT_FUNBOX, WECHAT_TG)
+        HostType.DOUYIN -> ImageSourcePaths(DOUYIN_IMAGES, DOUYIN_FUNBOX, DOUYIN_TG)
     }
 }

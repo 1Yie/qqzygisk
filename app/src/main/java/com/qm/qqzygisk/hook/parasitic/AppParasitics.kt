@@ -22,6 +22,7 @@ import com.highcapable.kavaref.extension.classOf
 import com.highcapable.kavaref.extension.lazyClass
 import com.highcapable.kavaref.extension.lazyClassOrNull
 import com.highcapable.kavaref.extension.toClassOrNull
+import com.qm.qqzygisk.R
 import com.qm.qqzygisk.hook.extension.InstrumentationDelegate
 import com.qm.qqzygisk.hook.extension.hook
 import com.qm.qqzygisk.hook.parasitic.activity.config.ActivityProxyConfig
@@ -233,18 +234,34 @@ internal object AppParasitics {
 
     private var isSetImplHooked = false
 
+    /** Verify actual availability; host Resources/AssetManager instances can change at runtime. */
     internal fun injectModuleAppResources(hostResources: Resources) {
-        runCatching {
-            if (currentPackageName == ModuleUtils.modulePackageName)
-                return Log.error("You cannot inject module resources into yourself")
-            hostResources.assets.asResolver()
-                .firstMethod {
-                    name = "addAssetPath"
-                    parameters(String::class)
-                }.invoke(ModuleUtils.moduleAppFilePath)
-            injectedResources.add(hostResources)
-        }.onFailure {
-            Log.error("Failed to inject module resources into [$hostResources]", it)
+        runCatching { ensureModuleAppResources(hostResources) }
+            .onFailure { Log.error("Failed to inject module resources into [$hostResources]", it) }
+    }
+
+    internal fun ensureModuleAppResources(hostResources: Resources) {
+        synchronized(hostResources) {
+            ensureModuleResource(
+                isReadable = {
+                    runCatching {
+                        hostResources.getColor(R.color.qqz_primary, null)
+                        hostResources.getResourceName(R.style.Theme_AppDefault)
+                    }.isSuccess
+                },
+                attach = {
+                    val path = ModuleUtils.moduleAppFilePath
+                    check(java.io.File(path).let { it.isFile && it.canRead() }) {
+                        "无法读取模块资源 APK：$path"
+                    }
+                    val cookie = hostResources.assets.asResolver().firstMethod {
+                        name = "addAssetPath"
+                        parameters(String::class)
+                    }.invoke<Int>(path) ?: 0
+                    if (cookie > 0) Log.info("已加载模块资源: cookie=$cookie Resources@${System.identityHashCode(hostResources)}")
+                    cookie
+                },
+            )
         }
     }
 

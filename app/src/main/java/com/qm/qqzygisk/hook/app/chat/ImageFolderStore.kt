@@ -18,6 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 object ImageFolderStore {
     const val QQ_ZYGISK_PATH_KEY = "qq_zygisk_image_path"
     const val WECHAT_ZYGISK_PATH_KEY = "wx_zygisk_image_path"
+    const val DOUYIN_ZYGISK_PATH_KEY = "douyin_zygisk_image_path"
 
     const val FUNBOX_PATH_KEY = "funbox_emoticon_path"
     const val TG_STICKERS_PATH_KEY = "tg_stickers_emoticon_path"

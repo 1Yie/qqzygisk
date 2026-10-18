@@ -15,12 +15,12 @@ plugins {
 }
 
 zygisk {
-    packages("com.tencent.mobileqq", "com.tencent.mm")
+    packages("com.tencent.mobileqq", "com.tencent.mm", "com.ss.android.ugc.aweme")
 
     id = "com_qm.qqzygisk"
     name = "qqhook"
     author = "night_star"
-    description = "QQ 与微信本地表情面板"
+    description = "QQ、微信与抖音本地表情面板"
     entrypoint = "com.qm.qqzygisk.Main"
     archiveName = "qqhook"
     dir = "adb/qqzygisk"

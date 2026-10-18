@@ -1,16 +1,16 @@
 # qqhook
 
-Zygisk 模块：在 QQ 和微信的聊天表情按钮上长按，打开本地图片面板。
+Zygisk 模块：在 QQ、微信和抖音好友私信的聊天表情按钮上长按，打开本地图片面板。
 
 各宿主分别保存自己的目录配置。所有宿主的 **QQ Zygisk → 表情目录** 都提供相同的三个入口：QQ Zygisk 图片目录、FunBox 表情目录、TGStickersExported 表情目录。三种来源都会被面板扫描；新建分类、保存图片使用第一个目录。
 
 下表路径均相对于 `/storage/emulated/0/Android/media/`：
 
-| 来源 | QQ 默认目录 | 微信默认目录 |
-| --- | --- | --- |
-| QQ Zygisk 图片 | `com.tencent.mobileqq/.qqzygisk` | `com.tencent.mm/.qqzygisk` |
-| FunBox | `com.tencent.mobileqq/.fun/Sticker/Storage` | `com.tencent.mm/.fun/Sticker/Storage` |
-| TGStickersExported | `com.tencent.mobileqq/TGStickersExported/v1` | `com.tencent.mm/TGStickersExported/v1` |
+| 来源 | QQ 默认目录 | 微信默认目录 | 抖音默认目录 |
+| --- | --- | --- | --- |
+| QQ Zygisk 图片 | `com.tencent.mobileqq/.qqzygisk` | `com.tencent.mm/.qqzygisk` | `com.ss.android.ugc.aweme/.qqzygisk` |
+| FunBox | `com.tencent.mobileqq/.fun/Sticker/Storage` | `com.tencent.mm/.fun/Sticker/Storage` | `com.ss.android.ugc.aweme/.fun/Sticker/Storage` |
+| TGStickersExported | `com.tencent.mobileqq/TGStickersExported/v1` | `com.tencent.mm/TGStickersExported/v1` | `com.ss.android.ugc.aweme/TGStickersExported/v1` |
 
 路径可独立修改。FunBox 分类名称从其 Storage 旁的 `packs` 文件读取。请使用当前宿主能访问的目录。
 
@@ -22,7 +22,11 @@ QQ 发送前通过统一会话接口实时解析当前联系人，兼容面板�
 
 微信 8.0.79 的「设置」页提供 **QQ Zygisk** 入口。微信面板默认使用原生表情发送：调用微信本地表情导入接口，校验原始 MD5、缓存大小和 GIF 类型后，通过原生 `sendEmoji` 链路提交。无扩展名 GIF 也按文件头识别，发送前不转换为静态 Bitmap。导入或校验失败时提示错误，用户可在发送方式菜单中手动选择普通图片模式。
 
-更新模块后重新启动对应宿主以加载新代码。本项目的本地测试和 APK 签名核对无法代替实际收发验证。
+抖音适配版本为 **40.7.0（400701）**。仅在原生私信 `EmojiWidgetUI` 的表情按钮上注册长按；设置页使用原生 `CommonItemView` 插入 **QQ Zygisk**。抖音面板统一按普通图片消息发送。
+
+点击图片后，模块准备本地文件并直接提交抖音原生图片任务，由抖音处理上传和发送。抖音表情消息构造、收藏创建、自定义上传和原图地址解析流程均已移除。旧版保存的表情发送偏好不再使用。模块仍会在提交前校验原聊天，避免页面关闭或切换后误发；GIF 是否保留动画由抖音原生图片流程决定。
+
+更新模块后重新启动对应宿主以加载新代码。本项目的本地测试和 APK 签名核对无法代替实际收发验证；适配其他抖音版本前需重新核对混淆接口。
 
 本地验证与打包：
 
