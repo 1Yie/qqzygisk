@@ -14,6 +14,7 @@ import com.qm.qqzygisk.hook.app.chat.SaveImagePanel
 import com.qm.qqzygisk.hook.app.host.ChatSessionRef
 import com.qm.qqzygisk.hook.app.host.HostRuntime
 import com.qm.qqzygisk.hook.app.host.SendKind
+import com.qm.qqzygisk.hook.app.host.withPanelGuard
 import com.qm.qqzygisk.hook.extension.hook
 import com.qm.qqzygisk.hook.utils.HookSettings
 import com.qm.qqzygisk.hook.utils.Log
@@ -159,6 +160,10 @@ object EmoticonButtonHooker : BaseHooker() {
                 },
                 contentDescription = kind.contentDescription,
                 perform = { file -> HostRuntime.current.send(file, kind, session) },
+                performAsync = { file, complete, active ->
+                    val guardedSession = session?.withPanelGuard(active)
+                    HostRuntime.current.sendAsync(file, kind, guardedSession, complete)
+                },
             )
         }
 

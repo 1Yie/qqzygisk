@@ -90,8 +90,10 @@ internal object AioSessionBinder {
          * 会话已切换到别的聊天时返回 [LiveContact.Changed]。
          */
         fun liveContact(): LiveContact {
-            val root = rootRef.get() ?: return LiveContact.Unavailable
-            val contact = AioSessionBinder.contactOf(root) ?: return LiveContact.Unavailable
+            val root = rootRef.get() ?: return LiveContact.Unavailable.also {
+                Log.warn("QQ 会话不可用: 面板绑定的聊天根已释放")
+            }
+            val contact = AioSessionBinder.contactOf(root, diagnose = true) ?: return LiveContact.Unavailable
             if (AioSessionBinder.identityOf(contact) != openedIdentity) return LiveContact.Changed
             return LiveContact.Ready(contact)
         }
@@ -136,8 +138,14 @@ internal object AioSessionBinder {
 
     /** 从被触摸的 View 向上找最近的、仍然有效的绑定根，并记录当时的会话身份。 */
     fun sessionFor(view: View?): BoundSession? {
-        if (binding == null || view == null) return null
-        if (!view.isLiveInWindow()) return null
+        if (binding == null || view == null) {
+            Log.warn("QQ 打开面板时无法绑定会话: hookReady=${binding != null} viewReady=${view != null}")
+            return null
+        }
+        if (!view.isLiveInWindow()) {
+            Log.warn("QQ 打开面板时触摸视图不可用: attached=${view.isAttachedToWindow} shown=${view.isShown} window=${view.windowVisibility}")
+            return null
+        }
         var current: View? = view
         while (current != null) {
             if (roots.containsKey(current)) {
@@ -145,6 +153,7 @@ internal object AioSessionBinder {
             }
             current = current.parent as? View
         }
+        Log.warn("QQ 触摸位置没有可用的 AIO 根绑定: view=${view.javaClass.name}")
         return null
     }
 
@@ -165,18 +174,27 @@ internal object AioSessionBinder {
 
     /** 打开面板时的会话句柄：联系人可解析、身份可记录才算有效。 */
     private fun openedSession(root: View): BoundSession? {
-        val contact = contactOf(root) ?: return null
-        val identity = identityOf(contact) ?: return null
+        val contact = contactOf(root, diagnose = true) ?: return null
+        val identity = identityOf(contact) ?: run {
+            Log.warn("QQ 打开面板时会话身份尚不可用")
+            return null
+        }
         return BoundSession(WeakReference(root), identity)
     }
 
-    private fun contactOf(root: View): Any? {
-        val current = binding ?: return null
-        if (!root.isLiveInWindow()) return null
-        val owner = synchronized(roots) { roots[root]?.get() } ?: return null
-        if (readField(current.rootField, owner) !== root) return null
-        val aioParam = readField(current.aioParamField, owner) ?: return null
-        val aioSession = readField(current.aioSessionField, aioParam) ?: return null
+    private fun contactOf(root: View, diagnose: Boolean = false): Any? {
+        fun unavailable(reason: String): Any? {
+            if (diagnose) Log.warn("QQ 会话不可用: $reason")
+            return null
+        }
+        val current = binding ?: return unavailable("AIO hook 尚未安装")
+        if (!root.isLiveInWindow()) return unavailable(
+            "聊天根未在可见窗口: attached=${root.isAttachedToWindow} shown=${root.isShown} window=${root.windowVisibility}",
+        )
+        val owner = synchronized(roots) { roots[root]?.get() } ?: return unavailable("聊天根缺少存活的 ChatPie")
+        if (readField(current.rootField, owner) !== root) return unavailable("ChatPie 已更换聊天根")
+        val aioParam = readField(current.aioParamField, owner) ?: return unavailable("AIOParam 尚未就绪")
+        val aioSession = readField(current.aioSessionField, aioParam) ?: return unavailable("AIOSession 尚未就绪")
         return runCatching { current.converter.invoke(current.converterOwner, aioSession) }
             .onFailure { Log.warn("解析当前会话联系人失败", it) }
             .getOrNull()

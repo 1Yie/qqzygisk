@@ -24,11 +24,15 @@ internal object QQHostBridge : HostBridge {
         AioSessionBinder.sessionFor(view)?.let(::QqSessionRef)
 
     override fun send(file: File, kind: SendKind, session: ChatSessionRef?): Result<Unit> =
-        ChatImageSender.sendImage(
-            file = file,
-            type = kind.toSendType(),
-            session = (session as? QqSessionRef)?.session,
-        )
+        ChatImageSender.sendToContact(file, kind.toSendType()) { contactFor(session) }
+
+    /** The panel may decorate the session to enforce cancellation; do not downcast it. */
+    internal fun contactFor(session: ChatSessionRef?): Any =
+        when (val current = session?.resolve() ?: SessionTarget.Unavailable) {
+            is SessionTarget.Ready -> current.target
+            SessionTarget.Changed -> error("聊天会话已切换，请重新打开面板")
+            SessionTarget.Unavailable -> error("没有可用的聊天会话，请重新进入聊天页面")
+        }
 
     override fun installSettingsEntry(activity: Activity): Boolean = SettingHooker.load()
 
@@ -40,7 +44,7 @@ internal object QQHostBridge : HostBridge {
         SendKind.EMOTICON -> ChatImageSender.SendType.EMOTICON
     }
 
-    private class QqSessionRef(val session: AioSessionBinder.BoundSession) : ChatSessionRef {
+    private class QqSessionRef(private val session: AioSessionBinder.BoundSession) : ChatSessionRef {
         override fun resolve(): SessionTarget = when (val live = session.liveContact()) {
             is AioSessionBinder.LiveContact.Ready -> SessionTarget.Ready(live.contact)
             AioSessionBinder.LiveContact.Changed -> SessionTarget.Changed
