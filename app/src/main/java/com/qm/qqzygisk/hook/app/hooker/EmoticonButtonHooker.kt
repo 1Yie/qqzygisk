@@ -8,28 +8,30 @@ import android.widget.ImageView
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.qm.qqzygisk.R
 import com.qm.qqzygisk.hook.app.base.BaseHooker
-import com.qm.qqzygisk.hook.app.chat.AioSessionBinder
-import com.qm.qqzygisk.hook.app.chat.ChatImageSender
 import com.qm.qqzygisk.hook.app.chat.ImagePanelAction
+import com.qm.qqzygisk.hook.app.chat.ImageFolderStore
 import com.qm.qqzygisk.hook.app.chat.SaveImagePanel
+import com.qm.qqzygisk.hook.app.host.ChatSessionRef
+import com.qm.qqzygisk.hook.app.host.HostRuntime
+import com.qm.qqzygisk.hook.app.host.SendKind
 import com.qm.qqzygisk.hook.extension.hook
 import com.qm.qqzygisk.hook.utils.HookSettings
 import com.qm.qqzygisk.hook.utils.Log
 
 /**
- * 长按 QQ 聊天输入栏表情图标，打开自定义图片面板。
+ * 长按宿主聊天输入栏表情图标，打开自定义图片面板。
  *
- * 这里只安装框架层（View/Activity）的图标发现 hook；聊天会话绑定 hook 由
- * [installHostHooks] 在宿主类可加载、聊天尚未创建时安装。
+ * 这里只安装与宿主无关的框架层（View/Activity）图标发现 hook；会话解析与发送通过
+ * [HostRuntime.current]（[com.qm.qqzygisk.hook.app.host.HostBridge]）交给各宿主实现，
+ * 聊天会话绑定 hook 由 [installHostHooks] 在宿主类可加载、聊天尚未创建时安装。
  */
 object EmoticonButtonHooker : BaseHooker() {
     override val key = "emoticon_image_panel"
     override val name = "长按表情按钮"
     override val description = "长按聊天框表情图标打开图片面板"
-    override val defaultEnabled = false
+    override val defaultEnabled: Boolean get() = ImageFolderStore.hostType.enablePanelByDefault
 
     private val enabled get() = HookSettings.isEnabled(key, defaultEnabled)
-    private const val PANEL_ACTION_KEY = "emoticon_panel_send_type"
     private const val ATTACHED_TAG = 0x51A1E201
 
     override fun initOnce() {
@@ -67,12 +69,19 @@ object EmoticonButtonHooker : BaseHooker() {
     }
 
     /**
-     * 在宿主类加载器可用、聊天尚未创建时安装会话绑定 hook。
+     * 在宿主类加载器可用、聊天尚未创建时安装宿主侧会话绑定 hook。
      * 由宿主生命周期入口在首个 Activity onCreate 前调用；安装失败会抛出，
      * 且不会置位，宿主后续生命周期入口可以重试。
      */
     fun installHostHooks() {
-        AioSessionBinder.install()
+        HostRuntime.current.installBeforeChat()
+    }
+
+    fun attachToView(view: View) = forceAttach(view)
+
+    fun attachToActivity(activity: Activity) {
+        attachById(activity)
+        activity.window?.decorView?.let(::scanTree)
     }
 
     private fun attachById(activity: Activity) {
@@ -108,20 +117,23 @@ object EmoticonButtonHooker : BaseHooker() {
         view.setTag(ATTACHED_TAG, true)
         view.isLongClickable = true
         view.setOnLongClickListener {
+            HookSettings.initialize(it.context)
             if (!enabled) {
                 Log.warn("长按表情图标时开关是关闭的")
                 return@setOnLongClickListener false
             }
             runCatching {
+                val hostBridge = HostRuntime.current
+                val actionKey = hostBridge.panelActionPreferenceKey
                 SaveImagePanel.show(
                     host = it.context,
-                    actions = panelActions(AioSessionBinder.sessionFor(it)),
+                    actions = panelActions(hostBridge.sessionFor(it)),
                     initialActionId = HookSettings.getString(
-                        PANEL_ACTION_KEY,
-                        ChatImageSender.SendType.IMAGE.name,
+                        actionKey,
+                        hostBridge.defaultSendKind.name,
                     ),
                     onActionSelected = { actionId ->
-                        HookSettings.setString(PANEL_ACTION_KEY, actionId)
+                        HookSettings.setString(actionKey, actionId)
                     },
                 )
             }.onFailure { error ->
@@ -135,29 +147,31 @@ object EmoticonButtonHooker : BaseHooker() {
         )
     }
 
-    private fun panelActions(session: AioSessionBinder.BoundSession?): List<ImagePanelAction> =
-        ChatImageSender.SendType.entries.map { type ->
-            val isEmoticon = type == ChatImageSender.SendType.EMOTICON
+    private fun panelActions(session: ChatSessionRef?): List<ImagePanelAction> =
+        HostRuntime.current.supportedKinds.map { kind ->
             ImagePanelAction(
-                id = type.name,
-                label = type.label,
-                iconRes = if (isEmoticon) {
+                id = kind.name,
+                label = kind.label,
+                iconRes = if (kind == SendKind.EMOTICON) {
                     R.drawable.ic_send_emoticon
                 } else {
                     R.drawable.ic_send_image
                 },
-                contentDescription = "发送为${type.label}",
-                perform = { file -> ChatImageSender.sendImage(file, type, session) },
+                contentDescription = kind.contentDescription,
+                perform = { file -> HostRuntime.current.send(file, kind, session) },
             )
         }
 
     private fun isChatInputEmoticonIcon(view: View): Boolean {
+        HostRuntime.current.matchesEmoticonButton(view)?.let { return it }
         if (view !is ImageView && view !is ImageButton) return false
         val description = view.contentDescription?.toString()?.trim().orEmpty()
         if (description.contains("商城") || description.contains("搜索") || description.contains("回复")) {
             return false
         }
-        if (description == "表情" || description.endsWith("表情")) return true
+        // 有描述时只认输入栏那个按钮本身：表情面板里的「黄脸表情 / 自定义表情 / 自拍表情」等
+        // 同样以「表情」结尾，用 endsWith 会把整个表情面板都挂上长按。
+        if (description.isNotEmpty()) return description == "表情"
         val name = resourceName(view)
         return name == "emo_btn" ||
             name.contains("emo_btn") ||

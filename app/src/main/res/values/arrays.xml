@@ -2,5 +2,6 @@
 <resources>
     <string-array name="xposedscope">
         <item>com.tencent.mobileqq</item>
+        <item>com.tencent.mm</item>
     </string-array>
 </resources>

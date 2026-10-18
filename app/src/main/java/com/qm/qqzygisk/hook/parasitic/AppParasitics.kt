@@ -225,6 +225,9 @@ internal object AppParasitics {
         return sCurrentActivityThread
     }
 
+    /** [Application.attach] 回调是否已记录过日志 */
+    private val attachCallbackLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** 已注入模块资源的 Resources 实例 */
     private val injectedResources = java.util.Collections.newSetFromMap(java.util.WeakHashMap<Resources, Boolean>())
 
@@ -277,26 +280,35 @@ internal object AppParasitics {
                 .optional(silent = true)
                 .apply {
                     // 最早的初始化时机
-                    firstMethod {
-                        name = "attach";
-                        parameters(Context::class)
-                    }
-                        .hook {
-                            before {
-                                runCatching {
-                                    appLifecycleActors.forEach { (_, actor) ->
-                                        (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, false) }
-                                    }
-                                }.onFailure { Log.error("attach",it) }
-                            }
-                            after {
-                                runCatching {
-                                    appLifecycleActors.forEach { (_, actor) ->
-                                        (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, true) }
-                                    }
-                                }.onFailure { Log.error("attach",it) }
-                            }
+                    runCatching {
+                        firstMethod {
+                            name = "attach";
+                            parameters(Context::class)
                         }
+                            .hook {
+                                before {
+                                    runCatching {
+                                        if (attachCallbackLogged.compareAndSet(false, true)) {
+                                            Log.info("Application.attach 回调已触发")
+                                        }
+                                        appLifecycleActors.forEach { (_, actor) ->
+                                            (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, false) }
+                                        }
+                                    }.onFailure { Log.error("attach",it) }
+                                }
+                                after {
+                                    runCatching {
+                                        appLifecycleActors.forEach { (_, actor) ->
+                                            (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, true) }
+                                        }
+                                    }.onFailure { Log.error("attach",it) }
+                                }
+                            }
+                        Log.info("Application.attach 生命周期 hook 已安装")
+                    }.onFailure {
+                        // 找不到 attach 时生命周期回调永远不会触发，宿主侧必须自带兜底。
+                        Log.error("安装 Application.attach 生命周期 hook 失败", it)
+                    }
 
                     // 应用终止时调用
                     // 用于清理资源、保存状态

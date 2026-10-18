@@ -20,6 +20,8 @@ import com.qm.qqzygisk.hook.app.hooker.RepeaterHooker
 import com.qm.qqzygisk.hook.app.hooker.SettingHooker
 import com.qm.qqzygisk.hook.app.hooker.StartActivityHooker
 import com.qm.qqzygisk.hook.app.hooker.SystemCameraHooker
+import com.qm.qqzygisk.hook.app.host.HostRuntime
+import com.qm.qqzygisk.hook.app.host.QQHostBridge
 import com.qm.qqzygisk.hook.extension.hook
 import com.qm.qqzygisk.hook.parasitic.AppParasitics
 import com.qm.qqzygisk.hook.parasitic.AppParasitics.setInstrumentation
@@ -57,10 +59,12 @@ object QQEntry {
         settings.clear()
         hostPackageName = packageName
         HostData.init(loader)
+        HostRuntime.install(QQHostBridge)
         Log.info("running on: ${HostData.toVerStr()}")
         runCatching { NtImageRkeyProvider.installHook() }
             .onFailure { Log.error("安装 NT 图片 rkey hook 失败", it) }
-        val generalSettingActivityClass = "com.tencent.mobileqq.activity.photo.CameraPreviewActivity".toAppClass()
+        val generalSettingActivityClass = HostRuntime.current.proxyActivityClass
+            ?: "com.tencent.mobileqq.activity.photo.CameraPreviewActivity".toAppClass()
         val hookedInstrumentationClass = "com.tencent.biz.richframework.hook.instrumentation.HookedInstrumentation".toAppClass()
         hookedInstrumentationClass
             .resolve()
@@ -179,13 +183,14 @@ object QQEntry {
      * 每个 hooker 自己保证幂等，安装失败时不置位，宿主后续生命周期时机可以继续重试。
      */
     private fun onHostActivityLifecycle(activity: Activity) {
-        if (hostUiHooksInstalled.get()) return
         if (!isHostActivity(activity)) return
+        HookSettings.initialize(activity)
+        if (hostUiHooksInstalled.get()) return
         alignHostClassLoader(activity)
         val start = SystemClock.elapsedRealtime()
         val chatMenu = ChatMenuHooker.load()
         val repeater = RepeaterHooker.load()
-        val setting = SettingHooker.load()
+        val setting = HostRuntime.current.installSettingsEntry(activity)
         val emoticonFailure = runCatching { EmoticonButtonHooker.installHostHooks() }.exceptionOrNull()
         val cost = SystemClock.elapsedRealtime() - start
         if (chatMenu && repeater && setting && emoticonFailure == null) {

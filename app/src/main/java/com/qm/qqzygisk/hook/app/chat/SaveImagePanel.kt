@@ -11,10 +11,12 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.text.InputType
 import android.text.TextUtils
+import android.util.AttributeSet
 import android.util.LruCache
 import android.util.TypedValue
 import android.view.ContextThemeWrapper
 import android.view.Gravity
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -54,6 +56,7 @@ data class ImagePanelAction(
     val iconRes: Int,
     val contentDescription: String = label,
     val perform: (File) -> Result<Unit>,
+    val performAsync: ((File, (Result<Unit>) -> Unit, () -> Boolean) -> Unit)? = null,
 )
 
 /**
@@ -71,6 +74,9 @@ class SaveImagePanel private constructor(
     private val selected = arrayOfNulls<File>(1)
     private lateinit var titleView: TextView
     private lateinit var folderRow: LinearLayout
+
+    /** 上次扫描到的分类列表，切换分类时复用，不重复扫盘。 */
+    private var loadedFolders: List<File> = emptyList()
     private var imageGrid: GridView? = null
     private var emptyHint: TextView? = null
     private var previewView: ImageView? = null
@@ -358,11 +364,11 @@ class SaveImagePanel private constructor(
     }
 
     private fun bindFolders() {
-        folderRow.removeAllViews()
-        val folders = ImageFolderStore.folders(includeExternal = browseOnly)
-        if (folders.isEmpty()) {
+        loadedFolders = ImageFolderStore.folders(includeExternal = browseOnly)
+        if (loadedFolders.isEmpty()) {
             selected[0] = null
             if (browseOnly) titleView.text = "图片面板"
+            folderRow.removeAllViews()
             folderRow.addView(
                 TextView(context).apply {
                     text = "还没有文件夹"
@@ -374,16 +380,22 @@ class SaveImagePanel private constructor(
             bindImages(null)
             return
         }
-        if (selected[0] == null || folders.none { it.absolutePath == selected[0]?.absolutePath }) {
-            selected[0] = ImageFolderStore.lastFolder(includeExternal = browseOnly) ?: folders.first()
+        if (selected[0] == null || loadedFolders.none { it.absolutePath == selected[0]?.absolutePath }) {
+            selected[0] = ImageFolderStore.lastFolderFrom(loadedFolders)
         }
+        renderFolderCards()
+        bindImages(selected[0])
+    }
+
+    /** 只重建分类栏，不重新遍历文件系统（切换分类时用，避免整盘重扫导致卡顿）。 */
+    private fun renderFolderCards() {
+        folderRow.removeAllViews()
         if (browseOnly) {
             titleView.text = selected[0]?.let(ImageFolderStore::displayName) ?: "图片面板"
         }
-        folders.forEach { folder ->
+        loadedFolders.forEach { folder ->
             folderRow.addView(folderCard(folder))
         }
-        bindImages(selected[0])
     }
 
     private fun folderCard(folder: File): View {
@@ -450,7 +462,8 @@ class SaveImagePanel private constructor(
             setOnClickListener {
                 selected[0] = folder
                 ImageFolderStore.remember(folder)
-                bindFolders()
+                renderFolderCards()
+                bindImages(folder)
             }
         }
     }
@@ -658,16 +671,29 @@ class SaveImagePanel private constructor(
         val action = selectedAction ?: return
         if (performingAction) return
         performingAction = true
-        action.perform(file)
-            .onSuccess {
-                ImageFolderStore.recordUsage(file)
-                panelDialog?.dismiss()
+        val finish: (Result<Unit>) -> Unit = { result ->
+            titleView.post {
+                if (!closed) {
+                    performImagePanelAction(
+                        send = { result },
+                        recordUsage = { ImageFolderStore.recordUsage(file) },
+                        onUsageFailure = { Log.error("发送已提交，更新表情历史失败", it) },
+                    ).onSuccess {
+                        panelDialog?.dismiss()
+                    }.onFailure {
+                        performingAction = false
+                        Log.error("${action.label}失败: ${file.absolutePath}", it)
+                        Toast.makeText(context, it.message ?: "${action.label}失败", Toast.LENGTH_LONG).show()
+                    }
+                }
             }
-            .onFailure {
-                performingAction = false
-                Log.error("${action.label}失败: ${file.absolutePath}", it)
-                Toast.makeText(context, it.message ?: "${action.label}失败", Toast.LENGTH_SHORT).show()
-            }
+        }
+        val async = action.performAsync
+        if (async != null) {
+            runCatching { async(file, finish) { !closed } }.onFailure { finish(Result.failure(it)) }
+        } else {
+            finish(runCatching { action.perform(file).getOrThrow() })
+        }
     }
 
     private fun traceVisibleThumbnails(event: String) {
@@ -959,7 +985,12 @@ class SaveImagePanel private constructor(
             val padding = context.dp(12)
             setPadding(padding, padding, padding, padding)
             disableEmptyLongClick()
-            setOnClickListener { showCreateFolder() }
+            setOnClickListener {
+                runCatching { showCreateFolder() }.onFailure { error ->
+                    Log.error("打开新建文件夹弹窗失败", error)
+                    Toast.makeText(context, "无法打开新建文件夹弹窗", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -1048,9 +1079,7 @@ class SaveImagePanel private constructor(
             }
             host.injectModuleAppResources()
             val moduleLoader = SaveImagePanel::class.java.classLoader ?: host.classLoader
-            val themed = object : ContextThemeWrapper(host, R.style.Theme_QQZygisk_MaterialDialog) {
-                override fun getClassLoader(): ClassLoader = moduleLoader
-            }
+            val themed = ModuleContext(host, R.style.Theme_QQZygisk_MaterialDialog, moduleLoader)
             SaveImagePanel(
                 themed,
                 imageUrls,
@@ -1064,3 +1093,52 @@ class SaveImagePanel private constructor(
 
 private fun Context.dp(value: Int): Int =
     (value * resources.displayMetrics.density).toInt()
+
+/** Module views must use a fresh inflater: cloneInContext also copies the host's Factory2. */
+private class ModuleContext(
+    base: Context,
+    themeRes: Int,
+    private val moduleLoader: ClassLoader,
+) : ContextThemeWrapper(base, themeRes) {
+    private var inflater: LayoutInflater? = null
+
+    override fun getClassLoader(): ClassLoader = moduleLoader
+
+    override fun getSystemService(name: String): Any? {
+        if (name == Context.LAYOUT_INFLATER_SERVICE) {
+            inflater?.let { return it }
+            return ModuleLayoutInflater(this).also { inflater = it }
+        }
+        return super.getSystemService(name)
+    }
+}
+
+private class ModuleLayoutInflater(context: Context) : LayoutInflater(context) {
+    init {
+        factory2 = object : LayoutInflater.Factory2 {
+            override fun onCreateView(parent: View?, name: String, context: Context, attrs: AttributeSet): View? {
+                if ('.' !in name || name.startsWith("android.")) return null
+                // Framework constructor caches can also contain the host's AndroidX classes.
+                // Resolve qualified module views directly with the module Context's loader.
+                val type = context.classLoader.loadClass(name).asSubclass(View::class.java)
+                return type.getConstructor(Context::class.java, AttributeSet::class.java).newInstance(context, attrs)
+            }
+
+            override fun onCreateView(name: String, context: Context, attrs: AttributeSet): View? =
+                onCreateView(null, name, context, attrs)
+        }
+    }
+
+    override fun cloneInContext(newContext: Context): LayoutInflater = ModuleLayoutInflater(newContext)
+
+    override fun onCreateView(name: String, attrs: AttributeSet): View {
+        for (prefix in listOf("android.widget.", "android.webkit.", "android.app.")) {
+            try {
+                return createView(name, prefix, attrs)
+            } catch (_: ClassNotFoundException) {
+                // Continue with the framework prefixes, matching PhoneLayoutInflater.
+            }
+        }
+        return super.onCreateView(name, attrs)
+    }
+}

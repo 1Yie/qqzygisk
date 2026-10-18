@@ -55,8 +55,44 @@ if ! mv "$PAYLOAD_NEXT" "$PAYLOAD_DIR"; then
 fi
 rm -rf "$PAYLOAD_OLD"
 
-cp "$MODPATH/app-release.apk" /data/user/0/com.tencent.mobileqq/files/mmkv​/fugfhj
-APP_UID=$(ps -ef | awk '$NF == "com.tencent.mobileqq" {print $2; exit}')
-set_perm_recursive "/data/user/0/com.tencent.mobileqq/files/mmkv​/fugfhj" $APP_UID $APP_UID 0755 0600
+# 资源注入用的模块 APK 副本：每个宿主各放一份。
+# 应用无权读取其它应用的数据目录，所以不能用一份公共副本；
+# 目录名里的零宽空格（U+200B）用于避开宿主自己的目录清理逻辑，
+# 必须与 ModuleUtils.HOST_MODULE_APK_SUFFIX 保持一致。
+MODULE_APK_DIR="mmkv$(printf '\342\200\213')"
+
+place_module_apk() {
+  PKG="$1"
+  PKG_DIR="/data/user/0/$PKG"
+  if [ ! -d "$PKG_DIR" ]; then
+    ui_print "- $PKG not installed, skip module apk copy"
+    return 0
+  fi
+  DEST="$PKG_DIR/files/$MODULE_APK_DIR/fugfhj"
+  mkdir -p "${DEST%/*}" || return 1
+  cp -f "$MODPATH/app-release.apk" "$DEST" || return 1
+  # 属主必须取宿主数据目录本身的 uid/gid（ps -ef 的 $2 是 PID，不是 uid）
+  OWNER=$(stat -c %u "$PKG_DIR" 2>/dev/null)
+  GROUP=$(stat -c %g "$PKG_DIR" 2>/dev/null)
+  if [ -z "$OWNER" ] || [ -z "$GROUP" ]; then
+    ui_print "! Failed to resolve uid of $PKG"
+    return 1
+  fi
+  chown "$OWNER:$GROUP" "${DEST%/*}" "$DEST" || return 1
+  chmod 0700 "${DEST%/*}"
+  chmod 0600 "$DEST"
+  restorecon -RF "${DEST%/*}" 2>/dev/null
+  ui_print "- module apk copy for $PKG (uid=$OWNER): $DEST"
+}
+
+place_module_apk com.tencent.mobileqq
+place_module_apk com.tencent.mm
+
+# 旧版本曾将微信媒体目录改成 appUid:appUid/0700，阻断 FUSE 媒体服务访问。
+# 在原始 /data/media 路径恢复权限，保留目录中的所有图片。
+[ -f "$MODPATH/repair-media-permissions.sh" ] || abort "! Media permission repair script missing"
+if ! /system/bin/sh "$MODPATH/repair-media-permissions.sh"; then
+  ui_print "! WeChat media permission repair incomplete; check the installer output above"
+fi
 
 rm -rf "$MODPATH/customize.d"
