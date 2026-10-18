@@ -76,6 +76,7 @@ class SaveImagePanel private constructor(
     private var previewView: ImageView? = null
     private var previewProgress: ProgressBar? = null
     private var panelDialog: Dialog? = null
+    private var deleteFolderButton: ImageButton? = null
     private var previewDialog: Dialog? = null
     private var performingAction = false
     private var selectedAction = actions.firstOrNull { it.id == initialActionId }
@@ -172,6 +173,10 @@ class SaveImagePanel private constructor(
                     LinearLayout.LayoutParams(context.dp(48), context.dp(48)),
                 )
             }
+            addView(
+                deleteFolderButton(),
+                LinearLayout.LayoutParams(context.dp(48), context.dp(48)),
+            )
             addView(
                 createFolderButton(),
                 LinearLayout.LayoutParams(context.dp(48), context.dp(48)),
@@ -371,7 +376,7 @@ class SaveImagePanel private constructor(
                     setPadding(context.dp(4), context.dp(12), context.dp(4), context.dp(12))
                 },
             )
-            bindImages(null)
+            refreshDeleteFolderButton()
             return
         }
         if (selected[0] == null || folders.none { it.absolutePath == selected[0]?.absolutePath }) {
@@ -384,6 +389,7 @@ class SaveImagePanel private constructor(
             folderRow.addView(folderCard(folder))
         }
         bindImages(selected[0])
+        refreshDeleteFolderButton()
     }
 
     private fun folderCard(folder: File): View {
@@ -451,6 +457,13 @@ class SaveImagePanel private constructor(
                 selected[0] = folder
                 ImageFolderStore.remember(folder)
                 bindFolders()
+            }
+            if (ImageFolderStore.canDelete(folder)) {
+                isLongClickable = true
+                setOnLongClickListener {
+                    confirmDeleteFolder(folder)
+                    true
+                }
             }
         }
     }
@@ -777,6 +790,79 @@ class SaveImagePanel private constructor(
             }
         }
         dialog.show()
+    }
+
+    private fun confirmDeleteFolder(folder: File) {
+        if (!ImageFolderStore.canDelete(folder)) {
+            Toast.makeText(context, "这个文件夹不能删除", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val name = ImageFolderStore.displayName(folder)
+        val message = TextView(context).apply {
+            text = "确定删除文件夹「$name」？其中的图片会一起删除，且无法恢复。"
+            setTextColor(colors.onSurface)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(context.dp(24), context.dp(8), context.dp(24), context.dp(12))
+        }
+        val dialog = MaterialAlertDialogBuilder(context)
+            .setTitle("删除文件夹")
+            .setView(message)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("删除", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.window?.setLayout(
+                (context.resources.displayMetrics.widthPixels * 0.86f).toInt()
+                    .coerceAtLeast(context.dp(280)),
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            val delete = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+            delete.setTextColor(ContextCompat.getColor(context, R.color.qqz_error))
+            delete.setOnClickListener {
+                runCatching {
+                    ImageFolderStore.deleteFolder(folder)
+                }.onSuccess {
+                    dialog.dismiss()
+                    if (selected[0]?.absolutePath == folder.absolutePath) selected[0] = null
+                    bindFolders()
+                    Toast.makeText(context, "已删除文件夹", Toast.LENGTH_SHORT).show()
+                }.onFailure {
+                    Log.error("删除文件夹失败: ${folder.absolutePath}", it)
+                    Toast.makeText(context, it.message ?: "删除失败", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun refreshDeleteFolderButton() {
+        val folder = selected[0]
+        deleteFolderButton?.visibility =
+            if (folder != null && ImageFolderStore.canDelete(folder)) View.VISIBLE else View.GONE
+    }
+
+    private fun deleteFolderButton(): ImageButton {
+        val selectableBackground = TypedValue().also {
+            context.theme.resolveAttribute(
+                android.R.attr.selectableItemBackgroundBorderless,
+                it,
+                true,
+            )
+        }.resourceId
+        return ImageButton(context).apply {
+            deleteFolderButton = this
+            setImageResource(R.drawable.ic_delete_folder)
+            setColorFilter(ContextCompat.getColor(context, R.color.qqz_error))
+            setBackgroundResource(selectableBackground)
+            contentDescription = "删除文件夹"
+            visibility = View.GONE
+            val padding = context.dp(12)
+            setPadding(padding, padding, padding, padding)
+            disableEmptyLongClick()
+            setOnClickListener {
+                selected[0]?.let(::confirmDeleteFolder)
+            }
+        }
     }
 
     private fun createActionMenuButton(): ImageButton {

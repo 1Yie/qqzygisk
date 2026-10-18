@@ -17,6 +17,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -32,11 +34,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import android.os.Handler
+import android.os.Looper
+import java.util.concurrent.atomic.AtomicBoolean
 import androidx.compose.ui.text.input.KeyboardType
 import com.qm.qqzygisk.hook.app.QQEntry.settings
 import com.qm.qqzygisk.hook.app.chat.ImageFolderStore
@@ -212,6 +218,13 @@ private fun ColumnScope.PathSettings() {
     val hasChanges = qqZygiskPath != savedQqZygiskPath ||
         funBoxPath != savedFunBoxPath ||
         tgStickersPath != savedTgStickersPath
+    var confirmMigrate by remember { mutableStateOf(false) }
+    var migrating by remember { mutableStateOf(false) }
+    var migrateMessage by remember { mutableStateOf<String?>(null) }
+    val migrationAlive = remember { AtomicBoolean(true) }
+    DisposableEffect(Unit) {
+        onDispose { migrationAlive.set(false) }
+    }
 
     Spacer(modifier = Modifier.height(20.dp))
     OutlinedTextField(
@@ -260,5 +273,90 @@ private fun ColumnScope.PathSettings() {
     ) {
         Text("保存路径")
     }
+    Spacer(modifier = Modifier.height(16.dp))
+    Button(
+        onClick = { confirmMigrate = true },
+        modifier = Modifier.fillMaxWidth(),
+        enabled = !migrating,
+    ) {
+        Text(if (migrating) "正在迁移…" else "迁移 FunBox 表情到 QQ Zygisk")
+    }
+    Text(
+        text = "按表情包名称复制到 QQ Zygisk 目录，不删除 FunBox 原文件。",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 8.dp),
+    )
     Spacer(modifier = Modifier.height(24.dp))
+
+    if (confirmMigrate) {
+        AlertDialog(
+            onDismissRequest = { confirmMigrate = false },
+            title = { Text("迁移 FunBox 表情") },
+            text = {
+                Text("把当前 FunBox 目录里的表情复制到 QQ Zygisk 目录？不会删除 FunBox 原文件。未保存的路径会先保存。")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmMigrate = false
+                        val qq = qqZygiskPath.trim()
+                            .ifEmpty { ImageFolderStore.DEFAULT_QQ_ZYGISK_PATH }
+                        val funBox = funBoxPath.trim()
+                            .ifEmpty { ImageFolderStore.DEFAULT_FUNBOX_PATH }
+                        val tg = tgStickersPath.trim()
+                            .ifEmpty { ImageFolderStore.DEFAULT_TG_STICKERS_PATH }
+                        qqZygiskPath = qq
+                        funBoxPath = funBox
+                        tgStickersPath = tg
+                        HookSettings.setString(ImageFolderStore.QQ_ZYGISK_PATH_KEY, qq)
+                        HookSettings.setString(ImageFolderStore.FUNBOX_PATH_KEY, funBox)
+                        HookSettings.setString(ImageFolderStore.TG_STICKERS_PATH_KEY, tg)
+                        savedQqZygiskPath = qq
+                        savedFunBoxPath = funBox
+                        savedTgStickersPath = tg
+                        migrating = true
+                        Thread({
+                            val message = runCatching {
+                                ImageFolderStore.migrateFunBoxToQqZygisk(funBox, qq)
+                            }.fold(
+                                onSuccess = { result ->
+                                    if (result.packs == 0) {
+                                        "没有可迁移的 FunBox 表情"
+                                    } else {
+                                        "已处理 ${result.packs} 个表情包，复制 ${result.copied} 张，跳过 ${result.skipped} 张"
+                                    }
+                                },
+                                onFailure = { it.message ?: "迁移失败" },
+                            )
+                            Handler(Looper.getMainLooper()).post {
+                                if (!migrationAlive.get()) return@post
+                                migrating = false
+                                migrateMessage = message
+                            }
+                        }, "QQZygisk-FunBoxMigrate").start()
+                    },
+                ) {
+                    Text("迁移")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmMigrate = false }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+    migrateMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { migrateMessage = null },
+            title = { Text("迁移结果") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { migrateMessage = null }) {
+                    Text("知道了")
+                }
+            },
+        )
+    }
 }

@@ -167,6 +167,143 @@ object ImageFolderStore {
         return folder
     }
 
+    fun canDelete(folder: File): Boolean {
+        if (!folder.isDirectory || isHistoryFolder(folder)) return false
+        val parent = folder.parentFile ?: return false
+        return parent.absolutePath == root().absolutePath && isOwned(folder)
+    }
+
+    fun deleteFolder(folder: File) {
+        check(canDelete(folder)) { "只能删除模块自己的文件夹" }
+        val rootPath = root().absolutePath
+        deleteTree(folder, rootPath)
+        val prefix = folder.absolutePath.trimEnd('/', '\\') + File.separator
+        synchronized(usageLock) {
+            val store = loadUsageLocked()
+            store.folders.remove(folder.absolutePath)
+            store.files.keys.removeAll { it.startsWith(prefix) }
+            saveUsageLocked(store)
+        }
+        if (HookSettings.getString(LAST_FOLDER_KEY, "") == folder.absolutePath) {
+            HookSettings.setString(LAST_FOLDER_KEY, "")
+        }
+        runCatching {
+            val marker = File(root(), LAST_FOLDER_FILE)
+            if (marker.isFile && marker.readText().trim() == folder.absolutePath) marker.delete()
+        }
+        notifyChanged()
+    }
+
+    private fun deleteTree(file: File, rootPath: String) {
+        val path = file.absolutePath
+        check(path == rootPath || path.startsWith(rootPath + File.separator)) {
+            "拒绝删除模块目录之外的文件"
+        }
+        if (file.isDirectory) {
+            file.listFiles()?.forEach { deleteTree(it, rootPath) }
+        }
+        check(file.delete()) { "无法删除文件夹: ${file.name}" }
+    }
+
+    data class FunBoxMigration(val packs: Int, val copied: Int, val skipped: Int)
+
+    /**
+     * 把 FunBox 表情包复制到 QQ Zygisk 目录。按 packs 里的名称建文件夹，不删除源文件。
+     */
+    fun migrateFunBoxToQqZygisk(funBoxPath: String, qqZygiskPath: String): FunBoxMigration {
+        val funBox = funBoxPath.trim()
+        val qqZygisk = qqZygiskPath.trim()
+        check(funBox.isNotEmpty() && qqZygisk.isNotEmpty()) { "目录不能为空" }
+        val sourceRoot = File(funBox).canonicalFile
+        val destRoot = File(qqZygisk).canonicalFile
+        check(sourceRoot.isDirectory) { "FunBox 目录不存在" }
+        check(sourceRoot != destRoot) { "FunBox 目录和 QQ Zygisk 目录相同" }
+        check(!sourceRoot.path.startsWith(destRoot.path + File.separator)) {
+            "FunBox 目录不能位于 QQ Zygisk 目录里面"
+        }
+        check(!destRoot.path.startsWith(sourceRoot.path + File.separator)) {
+            "QQ Zygisk 目录不能位于 FunBox 目录里面"
+        }
+        check(destRoot.isDirectory || destRoot.mkdirs()) { "无法创建 QQ Zygisk 目录" }
+        val names = funBoxPackNames(sourceRoot.path)
+        val usedNames = mutableSetOf<String>()
+        var packs = 0
+        var copied = 0
+        var skipped = 0
+        for (pack in listChildFolders(sourceRoot)) {
+            val images = collectImages(pack)
+            if (images.isEmpty()) continue
+            val display = names[pack.name]?.takeIf { it.isNotBlank() } ?: pack.name
+            val folderName = migrationFolderName(display, pack.name, usedNames) ?: continue
+            val dest = File(destRoot, folderName)
+            check(dest.isDirectory || dest.mkdirs()) { "无法创建文件夹: $folderName" }
+            packs++
+            for (image in images) {
+                if (placeImage(dest, image)) copied++ else skipped++
+            }
+        }
+        if (copied > 0) notifyChanged()
+        return FunBoxMigration(packs, copied, skipped)
+    }
+
+    private fun migrationFolderName(
+        display: String,
+        packId: String,
+        usedNames: MutableSet<String>,
+    ): String? {
+        var name = sanitizeName(display).ifEmpty { sanitizeName(packId) }
+        if (name.isEmpty() || name == HISTORY_DIR_NAME || name == "历史") {
+            name = sanitizeName(packId)
+        }
+        if (name.isEmpty() || name == HISTORY_DIR_NAME || name == "历史") return null
+        if (!usedNames.add(name)) {
+            val suffix = sanitizeName(packId).ifEmpty { "pack" }
+            name = sanitizeName("${name}_$suffix").ifEmpty { return null }
+            if (!usedNames.add(name) || name == HISTORY_DIR_NAME || name == "历史") return null
+        }
+        return name
+    }
+
+    private fun collectImages(pack: File): List<File> {
+        val root = pack.canonicalFile
+        val images = mutableListOf<File>()
+        fun walk(dir: File) {
+            dir.listFiles()?.forEach { child ->
+                val canonical = runCatching { child.canonicalFile }.getOrNull() ?: return@forEach
+                val inside = canonical == root || canonical.path.startsWith(root.path + File.separator)
+                if (!inside) return@forEach
+                when {
+                    canonical.isDirectory && !canonical.name.startsWith(".") -> walk(canonical)
+                    canonical.isFile && isImageFile(canonical) -> images.add(canonical)
+                }
+            }
+        }
+        walk(root)
+        return images
+    }
+
+    private fun placeImage(destDir: File, source: File): Boolean {
+        val preferred = File(destDir, source.name)
+        if (preferred.canonicalFile == source.canonicalFile) return false
+        if (!preferred.exists()) {
+            source.copyTo(preferred)
+            return true
+        }
+        if (preferred.length() == source.length()) return false
+        val ext = source.extension
+        val base = source.nameWithoutExtension.ifEmpty { source.name }
+        for (index in 2..1000) {
+            val name = if (ext.isEmpty()) "${base}_$index" else "${base}_$index.$ext"
+            val candidate = File(destDir, name)
+            if (!candidate.exists()) {
+                source.copyTo(candidate)
+                return true
+            }
+            if (candidate.length() == source.length()) return false
+        }
+        error("无法写入: ${source.name}")
+    }
+
     fun saveImage(folder: File, bytes: ByteArray, extension: String): File {
         check(isOwned(folder)) { "只能保存到模块自己的文件夹" }
         ensureFolder(folder)
@@ -282,18 +419,9 @@ object ImageFolderStore {
             return cached.names
         }
 
-        val names = runCatching {
-            val list = JSONObject(packsFile.readText()).optJSONArray("list")
-                ?: return@runCatching emptyMap()
-            buildMap {
-                for (index in 0 until list.length()) {
-                    val pack = list.optJSONObject(index) ?: continue
-                    val id = pack.optString("id").trim()
-                    val name = pack.optString("name").trim()
-                    if (id.isNotEmpty() && name.isNotEmpty()) put(id, name)
-                }
-            }
-        }.getOrDefault(emptyMap())
+        val raw = packsFile.readText()
+        val names = runCatching { parseFunBoxPackList(raw) }
+            .getOrElse { parseFunBoxPackListFallback(raw) }
         funBoxNameCache = FunBoxNameCache(
             path = packsFile.absolutePath,
             lastModified = packsFile.lastModified(),
@@ -301,6 +429,36 @@ object ImageFolderStore {
             names = names,
         )
         return names
+    }
+
+    private fun parseFunBoxPackList(raw: String): Map<String, String> {
+        val list = JSONObject(raw).optJSONArray("list") ?: return emptyMap()
+        return buildMap {
+            for (index in 0 until list.length()) {
+                val pack = list.optJSONObject(index) ?: continue
+                val id = pack.optString("id").trim()
+                val name = pack.optString("name").trim()
+                if (id.isNotEmpty() && name.isNotEmpty()) put(id, name)
+            }
+        }
+    }
+
+    private fun parseFunBoxPackListFallback(raw: String): Map<String, String> {
+        val names = linkedMapOf<String, String>()
+        Regex("\\{[^{}]*\\}").findAll(raw).forEach { match ->
+            val id = jsonStringField(match.value, "id")?.trim().orEmpty()
+            val name = jsonStringField(match.value, "name")?.trim().orEmpty()
+            if (id.isNotEmpty() && name.isNotEmpty()) names[id] = name
+        }
+        return names
+    }
+
+    private fun jsonStringField(source: String, key: String): String? {
+        val match = Regex("\"${Regex.escape(key)}\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+            .find(source) ?: return null
+        return match.groupValues[1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
     }
 
     private fun findFunBoxPacksFile(storagePath: String): File? {
