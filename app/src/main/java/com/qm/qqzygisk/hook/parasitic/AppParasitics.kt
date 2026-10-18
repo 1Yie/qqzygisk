@@ -246,6 +246,21 @@ internal object AppParasitics {
     }
 
     /**
+     * 在宿主 Activity 创建入口（[InstrumentationDelegate.callActivityOnCreate]）转发给宿主原始实现之前，
+     * 派发所有 [AppLifecycleActor.beforeActivityCreateCallback]。
+     *
+     * 这里是普通 Java 子类的直接方法调用，不是框架 Instrumentation 的 HookTransformer，
+     * 因此依赖宿主 UI 的安装在首个 Activity 方法体执行前同步完成，且不会在 hook 回调里再次嵌套安装。
+     */
+    internal fun dispatchBeforeActivityCreate(activity: Activity) {
+        if (appLifecycleActors.isEmpty()) return
+        appLifecycleActors.forEach { (_, actor) ->
+            runCatching { actor.beforeActivityCreateCallback?.invoke(activity) }
+                .onFailure { Log.error("beforeActivityCreate", it) }
+        }
+    }
+
+    /**
      * 注入当前 Hook APP (宿主) 全局生命周期
      * @param packageName 包名
      */
@@ -420,6 +435,9 @@ internal object AppParasitics {
 
         /** [Application.onCreate] 回调 */
         internal var onCreateCallback: (Application.() -> Unit)? = null
+
+        /** 宿主 Activity 创建前回调（在宿主原始 callActivityOnCreate 之前派发） */
+        internal var beforeActivityCreateCallback: ((Activity) -> Unit)? = null
 
         /** [Application.onTerminate] 回调 */
         internal var onTerminateCallback: (Application.() -> Unit)? = null

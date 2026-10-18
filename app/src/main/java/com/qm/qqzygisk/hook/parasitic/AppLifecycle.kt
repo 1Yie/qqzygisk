@@ -1,5 +1,6 @@
 package com.qm.qqzygisk.hook.parasitic
 
+import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -29,6 +30,17 @@ class AppLifecycle(private val isOnFailureThrowToApp: Boolean) {
      */
     fun onCreate(initiate: Application.() -> Unit) {
         AppParasitics.AppLifecycleActor.get("test").onCreateCallback = initiate
+    }
+
+    /**
+     * 监听当前 Hook APP (宿主) 的 Activity 创建。
+     *
+     * 回调在宿主原始 `Instrumentation.callActivityOnCreate` 之前派发（由模块的
+     * Instrumentation 委托直接调用），因此可在宿主 Activity 方法体执行前完成依赖宿主 UI 的安装。
+     * @param result 回调 - ([Activity] 即将创建的 Activity)
+     */
+    fun beforeActivityCreate(result: (Activity) -> Unit) {
+        AppParasitics.AppLifecycleActor.get("test").beforeActivityCreateCallback = result
     }
 
     /**

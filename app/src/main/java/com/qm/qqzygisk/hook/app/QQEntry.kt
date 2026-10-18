@@ -1,9 +1,6 @@
 package com.qm.qqzygisk.hook.app
 
 import android.app.Activity
-import android.app.Instrumentation
-import android.os.Bundle
-import android.os.PersistableBundle
 import android.os.SystemClock
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.qm.qqzygisk.hook.app.base.SettingData
@@ -39,11 +36,12 @@ object QQEntry {
      */
     private val hostUiHookers = listOf(ChatMenuHooker, RepeaterHooker, SettingHooker)
 
-    /** 宿主 UI 相关 hook 是否已全部安装成功 */
-    private val hostUiHooksInstalled = AtomicBoolean(false)
-
-    /** 安装失败日志只输出一次，避免宿主每个 Activity 重复刷屏 */
-    private val hostUiHooksFailureLogged = AtomicBoolean(false)
+    /**
+     * 宿主就绪 hook 安装闸门：一次性、重入/并发安全，失败即本进程终态。
+     * 宿主每个 Activity 生命周期事件都会进入 [onHostActivityLifecycle]，但只有第一个
+     * 真正执行安装。
+     */
+    private val hostHookInstallGate = HostHookInstallGate()
 
     /** 宿主 ClassLoader 对比日志只输出一次 */
     private val hostClassLoaderLogged = AtomicBoolean(false)
@@ -71,8 +69,6 @@ object QQEntry {
                 }
             }
 
-        installHostActivityGate()
-
         onAppLifecycle {
             attachBaseContext { baseContext, _ ->
                 HookSettings.initialize(baseContext)
@@ -80,8 +76,9 @@ object QQEntry {
             }
             onCreate {
                 registerModuleAppActivities(proxy = generalSettingActivityClass)
-                AntiRevokeHooker.retry()
-                RepeaterHooker.retry()
+            }
+            beforeActivityCreate { activity ->
+                onHostActivityLifecycle(activity)
             }
         }
         val hooks =
@@ -115,40 +112,51 @@ object QQEntry {
     }
 
     /**
-     * 安装宿主 Activity 生命周期入口。
+     * 宿主自己的 Activity 走到创建入口时安装依赖宿主资源的 hook。
      *
-     * 宿主 Application.onCreate 返回时宿主可能还没有真正完成 Application 初始化：
-     * 宿主真实 Application 的 onCreate 由 RFix/qfix 代理延迟派发，而宿主 UI 类的静态初始化
-     * 依赖该初始化（ViewUtils.<clinit> 需要 BaseApplication.context）。过早安装会失败并
-     * 永久污染这些宿主类，因此这里只挂框架 Instrumentation 的 Activity 生命周期入口，
-     * 等宿主自己的 Activity 真正创建/可见时再安装，且每次宿主生命周期时机都可重试。
+     * 该回调由 [InstrumentationDelegate] 在转发宿主原始 `callActivityOnCreate` 之前直接派发
+     * （不是框架 Instrumentation 的 HookTransformer），因此依赖宿主 UI 的安装在首个 Activity
+     * （含通知进入的聊天）方法体执行前同步完成。
+     *
+     * 安装由 [HostHookInstallGate] 保证一次性：重入/并发的 Activity 生命周期事件不会重复安装；
+     * 失败（含部分 hook 安装后失败）对该进程是终态，不会在每个 Activity 反复改写 hook 入口。
      */
-    private fun installHostActivityGate() {
-        val activityGate: (Activity) -> Unit = { activity ->
-            runCatching { onHostActivityLifecycle(activity) }
-                .onFailure { Log.error("宿主 Activity 生命周期入口执行失败", it) }
+    private fun onHostActivityLifecycle(activity: Activity) {
+        if (!isHostActivity(activity)) return
+        try {
+            hostHookInstallGate.install { installHostHooks(activity) }
+        } catch (th: Throwable) {
+            Log.error("依赖宿主资源的 hook 安装异常, 本进程不再重试", th)
         }
-        listOf(
-            "callActivityOnCreate" to arrayOf<Any>(Activity::class, Bundle::class),
-            "callActivityOnCreate" to arrayOf<Any>(Activity::class, Bundle::class, PersistableBundle::class),
-            "callActivityOnResume" to arrayOf<Any>(Activity::class),
-        ).forEach { (methodName, parameterTypes) ->
-            runCatching {
-                Instrumentation::class
-                    .resolve()
-                    .optional(silent = true)
-                    .firstMethodOrNull {
-                        name = methodName
-                        parameters(*parameterTypes)
-                    }
-                    ?.hook {
-                        before {
-                            val activity = args.getOrNull(0) as? Activity ?: return@before
-                            activityGate(activity)
-                        }
-                    }
-            }.onFailure { Log.error("安装宿主 Activity 生命周期入口失败: $methodName", it) }
+    }
+
+    /**
+     * 安装依赖宿主资源的 hook。
+     *
+     * 会话级 hook（防撤回）不依赖宿主 UI，只依赖宿主会话代理，放在宿主就绪时机安装一次。
+     *
+     * @return 是否全部安装成功
+     */
+    private fun installHostHooks(activity: Activity): Boolean {
+        alignHostClassLoader(activity)
+        val start = SystemClock.elapsedRealtime()
+        AntiRevokeHooker.retry()
+        val chatMenu = ChatMenuHooker.load()
+        val repeater = RepeaterHooker.load()
+        val setting = SettingHooker.load()
+        val emoticonFailure = runCatching { EmoticonButtonHooker.installHostHooks() }.exceptionOrNull()
+        val cost = SystemClock.elapsedRealtime() - start
+        val installed = chatMenu && repeater && setting && emoticonFailure == null
+        if (installed) {
+            Log.info("依赖宿主资源的 hook 安装完成, 耗时 ${cost}ms")
+        } else {
+            Log.error(
+                "依赖宿主资源的 hook 未全部安装, 本进程不再重试: " +
+                    "chatMenu=$chatMenu repeater=$repeater setting=$setting emoticon=${emoticonFailure == null}, 耗时 ${cost}ms",
+                emoticonFailure,
+            )
         }
+        return installed
     }
 
     /**
@@ -171,33 +179,6 @@ object QQEntry {
         if (moduleLoader !== hostLoader) {
             HostData.init(hostLoader)
             Log.warn("宿主 ClassLoader 与模块初始化时不同, 已对齐为宿主 Activity 的 ClassLoader: ${hostLoader.javaClass.name}")
-        }
-    }
-
-    /**
-     * 宿主自己的 Activity 走到生命周期入口时安装依赖宿主资源的 hook。
-     * 每个 hooker 自己保证幂等，安装失败时不置位，宿主后续生命周期时机可以继续重试。
-     */
-    private fun onHostActivityLifecycle(activity: Activity) {
-        if (hostUiHooksInstalled.get()) return
-        if (!isHostActivity(activity)) return
-        alignHostClassLoader(activity)
-        val start = SystemClock.elapsedRealtime()
-        val chatMenu = ChatMenuHooker.load()
-        val repeater = RepeaterHooker.load()
-        val setting = SettingHooker.load()
-        val emoticonFailure = runCatching { EmoticonButtonHooker.installHostHooks() }.exceptionOrNull()
-        val cost = SystemClock.elapsedRealtime() - start
-        if (chatMenu && repeater && setting && emoticonFailure == null) {
-            if (hostUiHooksInstalled.compareAndSet(false, true)) {
-                Log.info("依赖宿主资源的 hook 安装完成, 耗时 ${cost}ms")
-            }
-        } else if (hostUiHooksFailureLogged.compareAndSet(false, true)) {
-            Log.warn(
-                "依赖宿主资源的 hook 未全部安装, 等待宿主后续生命周期重试: " +
-                    "chatMenu=$chatMenu repeater=$repeater setting=$setting emoticon=${emoticonFailure == null}, 耗时 ${cost}ms",
-                emoticonFailure,
-            )
         }
     }
 

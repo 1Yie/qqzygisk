@@ -29,11 +29,16 @@ internal class InstrumentationDelegate private constructor(private val baseInsta
     internal companion object {
 
         /**
-         * 从 [Instrumentation] 创建 [InstrumentationDelegate] 实例
+         * 从 [Instrumentation] 创建 [InstrumentationDelegate] 实例。
+         *
+         * 已是 [InstrumentationDelegate] 时原样返回，避免对同一实例重复包装形成
+         * delegate-on-delegate 链（宿主可能多次触发 instrumentation 安装）。
          * @param baseInstance [Instrumentation] 实例
-         * @return [InstrumentationDelegate]
+         * @return [Instrumentation]
          */
-        internal fun wrapper(baseInstance: Instrumentation) = InstrumentationDelegate(baseInstance)
+        internal fun wrapper(baseInstance: Instrumentation): Instrumentation =
+            if (baseInstance is InstrumentationDelegate) baseInstance
+            else InstrumentationDelegate(baseInstance)
     }
 
     /**
@@ -209,11 +214,13 @@ internal class InstrumentationDelegate private constructor(private val baseInsta
 
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?, persistentState: PersistableBundle?) {
         activity.injectLifecycle(icicle)
+        AppParasitics.dispatchBeforeActivityCreate(activity)
         baseInstance.callActivityOnCreate(activity, icicle, persistentState)
     }
 
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?) {
         activity.injectLifecycle(icicle)
+        AppParasitics.dispatchBeforeActivityCreate(activity)
         baseInstance.callActivityOnCreate(activity, icicle)
     }
 
