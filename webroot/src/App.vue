@@ -1,18 +1,80 @@
 <script setup lang="ts">
-import { getState, toggleState } from "./utils/state";
+import { getState, setState } from "./utils/state";
 
-const err = ref("")
-const qqStatus = ref(false);
-onBeforeMount(async () => {
-  qqStatus.value = await getState();
-})
-const loading = ref(false);
-const qqUpdate = async () => {
-  loading.value = true;
-  const result = await toggleState();
-  err.value = result.stderr + "\n" +  result.stdout
-  loading.value = false;
+type Host = {
+  label: string;
+  packageName: string;
+  enabled: boolean;
+  known: boolean;
+  loading: boolean;
+  error: string;
 };
+
+const hosts = reactive<Host[]>([
+  {
+    label: "HOOK QQ",
+    packageName: "com.tencent.mobileqq",
+    enabled: false,
+    known: false,
+    loading: false,
+    error: "",
+  },
+  {
+    label: "HOOK 微信",
+    packageName: "com.tencent.mm",
+    enabled: false,
+    known: false,
+    loading: false,
+    error: "",
+  },
+  {
+    label: "HOOK 抖音",
+    packageName: "com.ss.android.ugc.aweme",
+    enabled: false,
+    known: false,
+    loading: false,
+    error: "",
+  },
+]);
+
+const refresh = async (host: Host) => {
+  host.loading = true;
+  host.error = "";
+  try {
+    host.enabled = await getState(host.packageName);
+    host.known = true;
+  } catch (error) {
+    host.error = `读取状态失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    host.loading = false;
+  }
+};
+
+const update = async (host: Host, enabled: boolean) => {
+  host.loading = true;
+  host.error = "";
+  try {
+    const result = await setState(host.packageName, enabled);
+    if (result.errno === 0) {
+      host.enabled = enabled;
+      host.known = true;
+    } else {
+      const output = [result.stderr, result.stdout]
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      host.error = output || `切换失败（退出码 ${result.errno}）`;
+    }
+  } catch (error) {
+    host.error = `修改失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    host.loading = false;
+  }
+};
+
+onBeforeMount(async () => {
+  await Promise.all(hosts.map(refresh));
+});
 </script>
 
 <template>
@@ -25,16 +87,23 @@ const qqUpdate = async () => {
         footer: 'soft',
       }"
     >
-      <div class="form">
-        <span>HOOK QQ</span>
-        <n-switch
-          :loading="loading"
-          v-model:value="qqStatus"
-          @update:value="qqUpdate"
-        />
-      </div>
+      <n-flex vertical size="large">
+        <div v-for="host in hosts" :key="host.packageName">
+          <div class="form">
+            <span>{{ host.label }}</span>
+            <n-switch
+              :value="host.enabled"
+              :loading="host.loading"
+              :disabled="!host.known"
+              :aria-label="host.label"
+              @update:value="(value: boolean) => update(host, value)"
+            />
+          </div>
+          <pre v-if="host.error" class="host-error">{{ host.error }}</pre>
+        </div>
+      </n-flex>
+      <div class="hint">修改后需重启对应应用生效</div>
     </n-card>
-    {{ err }}
   </n-flex>
 </template>
 
@@ -43,5 +112,19 @@ const qqUpdate = async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.host-error {
+  margin: 8px 0 0;
+  color: #d03050;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.hint {
+  margin-top: 12px;
+  color: #909399;
+  font-size: 12px;
 }
 </style>

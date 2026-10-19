@@ -1,6 +1,11 @@
-# qqhook v1.16
+# qqhook v1.17
 
-修复 v1.15 发布包遗漏 Web UI 的问题，恢复模块管理器中的 Web 入口和 QQ Hook 开关页面。保留 v1.15 的微信、抖音支持及现有配置。
+Web 页面新增微信和抖音的独立 Hook 开关，并修复 v1.15 发布包遗漏 Web UI 的问题。保留现有宿主适配与配置，各开关互不影响。
+
+## 新增
+
+- Web 设置页提供 QQ、微信、抖音三个独立开关，分别读取和修改对应宿主的启用状态。
+- 各开关独立显示加载状态和操作错误；修改失败时保留原状态，不影响其他宿主。修改后需重启对应应用生效。
 
 ## 修复
 
@@ -17,9 +22,9 @@
 
 | 平台 | 安装包 | 架构 |
 | --- | --- | --- |
-| Android 9 及以上（Zygisk 模块） | [qqhook.zip](https://github.com/Night-stars-1/qqzygisk/releases/download/v1.16/qqhook.zip) | arm64-v8a、armeabi-v7a |
+| Android 9 及以上（Zygisk 模块） | [qqhook.zip](https://github.com/Night-stars-1/qqzygisk/releases/download/v1.17/qqhook.zip) | arm64-v8a、armeabi-v7a |
 
-[完整变更：v1.15...v1.16](https://github.com/Night-stars-1/qqzygisk/compare/v1.15...v1.16)
+[完整变更：v1.15...v1.17](https://github.com/Night-stars-1/qqzygisk/compare/v1.15...v1.17)
 
 # qqhook v1.15
 

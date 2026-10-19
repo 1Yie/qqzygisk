@@ -1,20 +1,22 @@
 import { exec, moduleInfo } from "kernelsu";
 
-const info = JSON.parse(moduleInfo());
-const QQ_FILE = `/data/${info.dir}/packages/com.tencent.mobileqq`;
+let baseDir: string | undefined;
 
-async function getState() {
-  const { errno } = await exec(`test -e ${QQ_FILE}`);
+function markerPath(packageName: string) {
+  if (baseDir === undefined) {
+    baseDir = JSON.parse(moduleInfo()).dir;
+  }
+  return `/data/${baseDir}/packages/${packageName}`;
+}
+
+async function getState(packageName: string) {
+  const { errno } = await exec(`test -e ${markerPath(packageName)}`);
   return errno == 0;
 }
 
-async function toggleState() {
-  const state = await getState();
-  if (state) {
-    return await exec(`rm ${QQ_FILE}`);
-  } else {
-    return await exec(`touch ${QQ_FILE}`);
-  }
+async function setState(packageName: string, enabled: boolean) {
+  const marker = markerPath(packageName);
+  return await exec(enabled ? `touch ${marker}` : `rm -f ${marker}`);
 }
 
-export { getState, toggleState };
+export { getState, setState };
