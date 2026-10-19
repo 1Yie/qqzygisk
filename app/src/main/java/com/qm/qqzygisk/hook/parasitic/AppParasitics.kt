@@ -22,6 +22,7 @@ import com.highcapable.kavaref.extension.classOf
 import com.highcapable.kavaref.extension.lazyClass
 import com.highcapable.kavaref.extension.lazyClassOrNull
 import com.highcapable.kavaref.extension.toClassOrNull
+import com.qm.qqzygisk.R
 import com.qm.qqzygisk.hook.extension.InstrumentationDelegate
 import com.qm.qqzygisk.hook.extension.hook
 import com.qm.qqzygisk.hook.parasitic.activity.config.ActivityProxyConfig
@@ -225,23 +226,42 @@ internal object AppParasitics {
         return sCurrentActivityThread
     }
 
+    /** [Application.attach] 回调是否已记录过日志 */
+    private val attachCallbackLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** 已注入模块资源的 Resources 实例 */
     private val injectedResources = java.util.Collections.newSetFromMap(java.util.WeakHashMap<Resources, Boolean>())
 
     private var isSetImplHooked = false
 
+    /** Verify actual availability; host Resources/AssetManager instances can change at runtime. */
     internal fun injectModuleAppResources(hostResources: Resources) {
-        runCatching {
-            if (currentPackageName == ModuleUtils.modulePackageName)
-                return Log.error("You cannot inject module resources into yourself")
-            hostResources.assets.asResolver()
-                .firstMethod {
-                    name = "addAssetPath"
-                    parameters(String::class)
-                }.invoke(ModuleUtils.moduleAppFilePath)
-            injectedResources.add(hostResources)
-        }.onFailure {
-            Log.error("Failed to inject module resources into [$hostResources]", it)
+        runCatching { ensureModuleAppResources(hostResources) }
+            .onFailure { Log.error("Failed to inject module resources into [$hostResources]", it) }
+    }
+
+    internal fun ensureModuleAppResources(hostResources: Resources) {
+        synchronized(hostResources) {
+            ensureModuleResource(
+                isReadable = {
+                    runCatching {
+                        hostResources.getColor(R.color.qqz_primary, null)
+                        hostResources.getResourceName(R.style.Theme_AppDefault)
+                    }.isSuccess
+                },
+                attach = {
+                    val path = ModuleUtils.moduleAppFilePath
+                    check(java.io.File(path).let { it.isFile && it.canRead() }) {
+                        "无法读取模块资源 APK：$path"
+                    }
+                    val cookie = hostResources.assets.asResolver().firstMethod {
+                        name = "addAssetPath"
+                        parameters(String::class)
+                    }.invoke<Int>(path) ?: 0
+                    if (cookie > 0) Log.info("已加载模块资源: cookie=$cookie Resources@${System.identityHashCode(hostResources)}")
+                    cookie
+                },
+            )
         }
     }
 
@@ -292,26 +312,35 @@ internal object AppParasitics {
                 .optional(silent = true)
                 .apply {
                     // 最早的初始化时机
-                    firstMethod {
-                        name = "attach";
-                        parameters(Context::class)
-                    }
-                        .hook {
-                            before {
-                                runCatching {
-                                    appLifecycleActors.forEach { (_, actor) ->
-                                        (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, false) }
-                                    }
-                                }.onFailure { Log.error("attach",it) }
-                            }
-                            after {
-                                runCatching {
-                                    appLifecycleActors.forEach { (_, actor) ->
-                                        (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, true) }
-                                    }
-                                }.onFailure { Log.error("attach",it) }
-                            }
+                    runCatching {
+                        firstMethod {
+                            name = "attach";
+                            parameters(Context::class)
                         }
+                            .hook {
+                                before {
+                                    runCatching {
+                                        if (attachCallbackLogged.compareAndSet(false, true)) {
+                                            Log.info("Application.attach 回调已触发")
+                                        }
+                                        appLifecycleActors.forEach { (_, actor) ->
+                                            (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, false) }
+                                        }
+                                    }.onFailure { Log.error("attach",it) }
+                                }
+                                after {
+                                    runCatching {
+                                        appLifecycleActors.forEach { (_, actor) ->
+                                            (this.args[0] as? Context?)?.also { actor.attachBaseContextCallback?.invoke(it, true) }
+                                        }
+                                    }.onFailure { Log.error("attach",it) }
+                                }
+                            }
+                        Log.info("Application.attach 生命周期 hook 已安装")
+                    }.onFailure {
+                        // 找不到 attach 时生命周期回调永远不会触发，宿主侧必须自带兜底。
+                        Log.error("安装 Application.attach 生命周期 hook 失败", it)
+                    }
 
                     // 应用终止时调用
                     // 用于清理资源、保存状态

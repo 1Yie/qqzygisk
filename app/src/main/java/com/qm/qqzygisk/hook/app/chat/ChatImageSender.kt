@@ -33,13 +33,22 @@ object ChatImageSender {
         file: File,
         type: SendType,
         session: AioSessionBinder.BoundSession?,
-    ): Result<Unit> = runCatching {
-        check(file.isFile && file.canRead()) { "图片文件不可用" }
-        val contact = when (val live = session?.liveContact() ?: AioSessionBinder.LiveContact.Unavailable) {
+    ): Result<Unit> = sendToContact(file, type) {
+        when (val live = session?.liveContact() ?: AioSessionBinder.LiveContact.Unavailable) {
             is AioSessionBinder.LiveContact.Ready -> live.contact
             is AioSessionBinder.LiveContact.Changed -> error("聊天会话已切换，请重新打开面板")
             is AioSessionBinder.LiveContact.Unavailable -> error("没有可用的聊天会话，请重新进入聊天页面")
         }
+    }
+
+    /** Resolve at submission time so decorated panel sessions retain their safety checks. */
+    internal fun sendToContact(
+        file: File,
+        type: SendType,
+        resolveContact: () -> Any,
+    ): Result<Unit> = runCatching {
+        check(file.isFile && file.canRead()) { "图片文件不可用" }
+        val contact = resolveContact()
 
         val msgUtilType = loadClass(MSG_UTIL_API_CLASS)
         val msgUtil = qRouteApi(msgUtilType)

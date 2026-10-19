@@ -45,7 +45,9 @@ import android.os.Looper
 import java.util.concurrent.atomic.AtomicBoolean
 import androidx.compose.ui.text.input.KeyboardType
 import com.qm.qqzygisk.hook.app.QQEntry.settings
+import com.qm.qqzygisk.hook.app.host.HostType
 import com.qm.qqzygisk.hook.app.chat.ImageFolderStore
+import com.qm.qqzygisk.hook.app.hooker.EmoticonButtonHooker
 import com.qm.qqzygisk.hook.utils.HookSettings
 import com.qm.qqzygisk.ui.component.setting.SettingSwitch
 
@@ -107,7 +109,12 @@ private fun MainSettings(
             .padding(horizontal = 16.dp)
             .verticalScroll(rememberScrollState()),
     ) {
-        settings.forEach { setting ->
+        val availableSettings = if (ImageFolderStore.hostType != HostType.QQ) {
+            listOf(EmoticonButtonHooker.toSettingData())
+        } else {
+            settings
+        }
+        availableSettings.forEach { setting ->
             var isEnabled by remember(setting.key) {
                 mutableStateOf(
                     HookSettings.isEnabled(setting.key, setting.defaultEnabled)
@@ -123,7 +130,6 @@ private fun MainSettings(
                 }
             )
         }
-        Spacer(modifier = Modifier.height(8.dp))
         var historyLimitText by remember {
             mutableStateOf(ImageFolderStore.historyLimit().toString())
         }
@@ -188,36 +194,15 @@ private fun PathSettingsPage(modifier: Modifier = Modifier) {
 
 @Composable
 private fun ColumnScope.PathSettings() {
-    var qqZygiskPath by remember {
-        mutableStateOf(
-            HookSettings.getString(
-                ImageFolderStore.QQ_ZYGISK_PATH_KEY,
-                ImageFolderStore.DEFAULT_QQ_ZYGISK_PATH,
-            ),
-        )
-    }
-    var funBoxPath by remember {
-        mutableStateOf(
-            HookSettings.getString(
-                ImageFolderStore.FUNBOX_PATH_KEY,
-                ImageFolderStore.DEFAULT_FUNBOX_PATH,
-            ),
-        )
-    }
-    var tgStickersPath by remember {
-        mutableStateOf(
-            HookSettings.getString(
-                ImageFolderStore.TG_STICKERS_PATH_KEY,
-                ImageFolderStore.DEFAULT_TG_STICKERS_PATH,
-            ),
-        )
-    }
-    var savedQqZygiskPath by remember { mutableStateOf(qqZygiskPath) }
+    val initialPaths = remember { ImageFolderStore.sourcePaths }
+    var imagePath by remember { mutableStateOf(initialPaths.images) }
+    var funBoxPath by remember { mutableStateOf(initialPaths.funBox) }
+    var tgStickersPath by remember { mutableStateOf(initialPaths.tgStickers) }
+    var savedImagePath by remember { mutableStateOf(imagePath) }
     var savedFunBoxPath by remember { mutableStateOf(funBoxPath) }
     var savedTgStickersPath by remember { mutableStateOf(tgStickersPath) }
-    val hasChanges = qqZygiskPath != savedQqZygiskPath ||
-        funBoxPath != savedFunBoxPath ||
-        tgStickersPath != savedTgStickersPath
+    val hasChanges = imagePath != savedImagePath ||
+        funBoxPath != savedFunBoxPath || tgStickersPath != savedTgStickersPath
     var confirmMigrate by remember { mutableStateOf(false) }
     var migrating by remember { mutableStateOf(false) }
     var migrateMessage by remember { mutableStateOf<String?>(null) }
@@ -228,10 +213,11 @@ private fun ColumnScope.PathSettings() {
 
     Spacer(modifier = Modifier.height(20.dp))
     OutlinedTextField(
-        value = qqZygiskPath,
-        onValueChange = { qqZygiskPath = it },
+        value = imagePath,
+        onValueChange = { imagePath = it },
         modifier = Modifier.fillMaxWidth(),
         label = { Text("QQ Zygisk 图片目录") },
+        supportingText = { Text("当前应用的新建文件夹和保存图片使用此目录") },
         minLines = 2,
         maxLines = 3,
     )
@@ -256,15 +242,13 @@ private fun ColumnScope.PathSettings() {
     Spacer(modifier = Modifier.height(12.dp))
     Button(
         onClick = {
-            qqZygiskPath = qqZygiskPath.trim()
-                .ifEmpty { ImageFolderStore.DEFAULT_QQ_ZYGISK_PATH }
-            funBoxPath = funBoxPath.trim().ifEmpty { ImageFolderStore.DEFAULT_FUNBOX_PATH }
-            tgStickersPath = tgStickersPath.trim()
-                .ifEmpty { ImageFolderStore.DEFAULT_TG_STICKERS_PATH }
-            HookSettings.setString(ImageFolderStore.QQ_ZYGISK_PATH_KEY, qqZygiskPath)
+            imagePath = imagePath.trim().ifEmpty { ImageFolderStore.defaultPath }
+            HookSettings.setString(ImageFolderStore.pathKey, imagePath)
+            savedImagePath = imagePath
+            funBoxPath = funBoxPath.trim().ifEmpty { ImageFolderStore.defaultFunBoxPath }
+            tgStickersPath = tgStickersPath.trim().ifEmpty { ImageFolderStore.defaultTgStickersPath }
             HookSettings.setString(ImageFolderStore.FUNBOX_PATH_KEY, funBoxPath)
             HookSettings.setString(ImageFolderStore.TG_STICKERS_PATH_KEY, tgStickersPath)
-            savedQqZygiskPath = qqZygiskPath
             savedFunBoxPath = funBoxPath
             savedTgStickersPath = tgStickersPath
         },
@@ -300,19 +284,19 @@ private fun ColumnScope.PathSettings() {
                 TextButton(
                     onClick = {
                         confirmMigrate = false
-                        val qq = qqZygiskPath.trim()
-                            .ifEmpty { ImageFolderStore.DEFAULT_QQ_ZYGISK_PATH }
+                        val qq = imagePath.trim()
+                            .ifEmpty { ImageFolderStore.defaultPath }
                         val funBox = funBoxPath.trim()
-                            .ifEmpty { ImageFolderStore.DEFAULT_FUNBOX_PATH }
+                            .ifEmpty { ImageFolderStore.defaultFunBoxPath }
                         val tg = tgStickersPath.trim()
-                            .ifEmpty { ImageFolderStore.DEFAULT_TG_STICKERS_PATH }
-                        qqZygiskPath = qq
+                            .ifEmpty { ImageFolderStore.defaultTgStickersPath }
+                        imagePath = qq
                         funBoxPath = funBox
                         tgStickersPath = tg
-                        HookSettings.setString(ImageFolderStore.QQ_ZYGISK_PATH_KEY, qq)
+                        HookSettings.setString(ImageFolderStore.pathKey, qq)
                         HookSettings.setString(ImageFolderStore.FUNBOX_PATH_KEY, funBox)
                         HookSettings.setString(ImageFolderStore.TG_STICKERS_PATH_KEY, tg)
-                        savedQqZygiskPath = qq
+                        savedImagePath = qq
                         savedFunBoxPath = funBox
                         savedTgStickersPath = tg
                         migrating = true

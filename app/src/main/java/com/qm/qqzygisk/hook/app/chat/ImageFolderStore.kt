@@ -1,6 +1,10 @@
 package com.qm.qqzygisk.hook.app.chat
 
+import com.qm.qqzygisk.hook.app.host.HostType
+import com.qm.qqzygisk.hook.parasitic.AppParasitics
 import com.qm.qqzygisk.hook.utils.HookSettings
+import com.qm.qqzygisk.hook.utils.Log
+import com.qm.qqzygisk.hook.utils.ModuleUtils
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
@@ -13,25 +17,45 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 object ImageFolderStore {
     const val QQ_ZYGISK_PATH_KEY = "qq_zygisk_image_path"
+    const val WECHAT_ZYGISK_PATH_KEY = "wx_zygisk_image_path"
+    const val DOUYIN_ZYGISK_PATH_KEY = "douyin_zygisk_image_path"
+
     const val FUNBOX_PATH_KEY = "funbox_emoticon_path"
     const val TG_STICKERS_PATH_KEY = "tg_stickers_emoticon_path"
-    const val DEFAULT_QQ_ZYGISK_PATH =
-        "/storage/emulated/0/Android/media/com.tencent.mobileqq/.qqzygisk"
-    const val DEFAULT_FUNBOX_PATH =
-        "/storage/self/primary/Android/media/com.tencent.mobileqq/.fun/Sticker/Storage"
-    const val DEFAULT_TG_STICKERS_PATH =
-        "/storage/self/primary/Android/media/com.tencent.mobileqq/TGStickersExported/v1"
-    val ROOT_PATH: String
-        get() = configuredPath(QQ_ZYGISK_PATH_KEY, DEFAULT_QQ_ZYGISK_PATH)
-    val SCAN_ROOTS: List<String>
-        get() = listOf(
-            configuredPath(FUNBOX_PATH_KEY, DEFAULT_FUNBOX_PATH),
-            configuredPath(TG_STICKERS_PATH_KEY, DEFAULT_TG_STICKERS_PATH),
-            ROOT_PATH,
-        ).distinct()
+
+    /** 同名配置保存在各自宿主的 SharedPreferences 中，互不覆盖。 */
+    const val DEFAULT_QQ_ZYGISK_PATH = HostImagePaths.QQ_IMAGES
+    const val DEFAULT_WECHAT_ZYGISK_PATH = HostImagePaths.WECHAT_IMAGES
+    const val DEFAULT_FUNBOX_PATH = HostImagePaths.QQ_FUNBOX
+    const val DEFAULT_TG_STICKERS_PATH = HostImagePaths.QQ_TG
+
+    internal val hostType: HostType
+        get() = HostType.fromPackageName(runCatching { ModuleUtils.packageName }.getOrNull())
+
+    val isWeChat: Boolean get() = hostType == HostType.WECHAT
+
+    /** 当前宿主的图片目录配置项 / 默认值。 */
+    val pathKey: String get() = hostType.imagePathKey
+
+    val defaultPath: String get() = HostImagePaths.defaults(hostType).images
+    val defaultFunBoxPath: String get() = HostImagePaths.defaults(hostType).funBox
+    val defaultTgStickersPath: String get() = HostImagePaths.defaults(hostType).tgStickers
+
+    internal val sourcePaths: ImageSourcePaths
+        get() = HostImagePaths.resolve(
+            hostType,
+            HookSettings.getString(pathKey, defaultPath),
+            HookSettings.getString(FUNBOX_PATH_KEY, defaultFunBoxPath),
+            HookSettings.getString(TG_STICKERS_PATH_KEY, defaultTgStickersPath),
+        )
+
+    val ROOT_PATH: String get() = sourcePaths.images
+
+    /** 所有宿主都扫描图片、FunBox、TG 三种来源，默认路径分别位于各自媒体目录。 */
+    val SCAN_ROOTS: List<String> get() = sourcePaths.scanRoots
+
     private const val LAST_FOLDER_FILE = ".last_folder"
     private const val LAST_FOLDER_KEY = "emoticon_panel_last_folder"
-    private const val USAGE_FILE = ".usage.json"
     const val HISTORY_DIR_NAME = "__history__"
     const val HISTORY_LIMIT_KEY = "history_limit"
     const val DEFAULT_HISTORY_LIMIT = 80
@@ -40,6 +64,7 @@ object ImageFolderStore {
     private val usageLock = Any()
     @Volatile
     private var usageCache: UsageStore? = null
+    private var usageCacheRoot: String? = null
     private val namePattern = Regex("[\\/:*?\"<>|]")
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
     private val imageExtensions = setOf("png", "jpg", "jpeg", "gif", "webp")
@@ -54,7 +79,10 @@ object ImageFolderStore {
         listeners.forEach { it() }
     }
 
-    fun root(): File = File(ROOT_PATH).apply { mkdirs() }
+    fun root(): File = File(ROOT_PATH).apply {
+        runCatching { ImageDirectoryAccess.ensureDirectory(this) }
+            .onFailure { Log.error("表情根目录不可用: $absolutePath", it) }
+    }
 
     fun isOwned(folder: File): Boolean =
         folder.absolutePath.startsWith(root().absolutePath + "/")
@@ -70,9 +98,15 @@ object ImageFolderStore {
     fun folders(includeExternal: Boolean = false): List<File> {
         val owned = listChildFolders(root())
         val extra = if (includeExternal) {
-            SCAN_ROOTS
+            SCAN_ROOTS.asSequence()
                 .filter { it != ROOT_PATH }
-                .flatMap { listChildFolders(File(it)) }
+                .map(::File)
+                .filter { it.isDirectory && it.canRead() }
+                .flatMap { listChildFolders(it).asSequence() }
+                // 外部目录里没有可读图片的分组不展示：系统可能放行列目录、却拒绝读文件，
+                // 过滤掉这些分组，避免出现一排点进去全空、切换还卡顿的分类。
+                .filter(::hasReadableImage)
+                .toList()
         } else {
             emptyList()
         }
@@ -83,6 +117,9 @@ object ImageFolderStore {
                 compareByDescending<File> { folderUsage(it) }
                     .thenBy { displayName(it).lowercase() },
             )
+        if (isWeChat) {
+            Log.info("微信目录扫描: root=$ROOT_PATH 自有分类=${owned.size} 外部分类=${extra.size}")
+        }
         return if (includeExternal) listOf(historyFolder()) + real else real
     }
 
@@ -104,7 +141,7 @@ object ImageFolderStore {
 
     fun displayName(folder: File): String {
         if (isHistoryFolder(folder)) return "历史"
-        val storagePath = configuredPath(FUNBOX_PATH_KEY, DEFAULT_FUNBOX_PATH)
+        val storagePath = sourcePaths.funBox
         if (folder.parentFile?.absolutePath != File(storagePath).absolutePath) return folder.name
         return funBoxPackNames(storagePath)[folder.name]?.takeIf { it.isNotBlank() } ?: folder.name
     }
@@ -131,14 +168,45 @@ object ImageFolderStore {
         }
     }
 
+    fun lastFolderFrom(available: List<File>): File? {
+        val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank {
+            // 目录可能属于别的宿主（微信读 QQ 的 Android/media 会被 EACCES 拒绝），
+            // 读失败只能当作没记录，绝不能让面板直接打开失败。
+            runCatching {
+                File(root(), LAST_FOLDER_FILE)
+                    .takeIf { it.isFile }
+                    ?.readText()
+                    ?.trim()
+            }.getOrNull().orEmpty()
+        }
+        if (saved.isEmpty()) return available.firstOrNull()
+        return available.firstOrNull { it.absolutePath == saved }
+            ?: available.firstOrNull { it.name == saved }
+            ?: available.firstOrNull()
+    }
+
+    /**
+     * 目录里是否存在**真的能打开**的图片。
+     *
+     * 只判断 canRead() 不够：跨应用访问 `Android/media/<其它包>` 时系统可能放行列目录、
+     * 却拒绝读文件，必须真开一次流才能确认，否则会出现一排点进去全空的分类。
+     */
+    private fun hasReadableImage(folder: File): Boolean {
+        val candidate = folder.listFiles()
+            ?.firstOrNull { it.isFile && isImageFile(it) }
+            ?: return false
+        return runCatching { java.io.FileInputStream(candidate).close() }.isSuccess
+    }
+
     fun lastFolder(includeExternal: Boolean = false): File? {
         val available = folders(includeExternal)
         val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank {
-            File(root(), LAST_FOLDER_FILE)
-                .takeIf { it.isFile }
-                ?.readText()
-                ?.trim()
-                .orEmpty()
+            runCatching {
+                File(ROOT_PATH, LAST_FOLDER_FILE)
+                    .takeIf { it.isFile }
+                    ?.readText()
+                    ?.trim()
+            }.getOrNull().orEmpty()
         }
         if (saved.isEmpty()) return available.firstOrNull()
         return available.firstOrNull { it.absolutePath == saved }
@@ -148,20 +216,12 @@ object ImageFolderStore {
 
     fun remember(folder: File) {
         HookSettings.setString(LAST_FOLDER_KEY, folder.absolutePath)
-        runCatching {
-            File(root(), LAST_FOLDER_FILE).apply {
-                parentFile?.mkdirs()
-                writeText(folder.absolutePath)
-            }
-        }
     }
 
     fun createFolder(rawName: String): File {
         val name = sanitizeName(rawName)
         check(name.isNotEmpty() && name != HISTORY_DIR_NAME && name != "历史") { "文件夹名无效" }
-        val folder = File(root(), name)
-        check(!folder.exists()) { "文件夹已存在: $name" }
-        check(folder.mkdirs()) { "无法创建文件夹: $name" }
+        val folder = ImageDirectoryAccess.createFolder(File(ROOT_PATH), name)
         remember(folder)
         notifyChanged()
         return folder
@@ -326,9 +386,6 @@ object ImageFolderStore {
         notifyChanged()
     }
 
-    private fun configuredPath(key: String, defaultValue: String): String =
-        HookSettings.getString(key, defaultValue).trim().ifEmpty { defaultValue }
-
     private fun listChildFolders(dir: File): List<File> =
         dir.listFiles()
             ?.filter { it.isDirectory && !it.name.startsWith(".") && it.name != HISTORY_DIR_NAME }
@@ -357,12 +414,16 @@ object ImageFolderStore {
         }
     }
 
-    private fun usageFile(): File = File(root(), USAGE_FILE)
+    private fun metadata(): ImagePanelMetadata {
+        val context = checkNotNull(AppParasitics.appContext) { "宿主 Application 尚未初始化" }
+        return ImagePanelMetadata(context.filesDir, File(ROOT_PATH))
+    }
 
     private fun loadUsageLocked(): UsageStore {
-        usageCache?.let { return it }
+        val currentRoot = ROOT_PATH
+        usageCache?.takeIf { usageCacheRoot == currentRoot }?.let { return it }
         val parsed = runCatching {
-            val raw = usageFile().takeIf { it.isFile }?.readText().orEmpty()
+            val raw = metadata().readUsage().orEmpty()
             if (raw.isBlank()) return@runCatching UsageStore()
             val json = JSONObject(raw)
             UsageStore(
@@ -370,18 +431,20 @@ object ImageFolderStore {
                 folders = readUsageMap(json.optJSONObject("folders")),
             )
         }.getOrDefault(UsageStore())
+        usageCacheRoot = currentRoot
         usageCache = parsed
         return parsed
     }
 
     private fun saveUsageLocked(store: UsageStore) {
+        usageCacheRoot = ROOT_PATH
         usageCache = store
-        val json = JSONObject()
-            .put("files", writeUsageMap(store.files))
-            .put("folders", writeUsageMap(store.folders))
-        val file = usageFile()
-        file.parentFile?.mkdirs()
-        file.writeText(json.toString())
+        runCatching {
+            val json = JSONObject()
+                .put("files", writeUsageMap(store.files))
+                .put("folders", writeUsageMap(store.folders))
+            metadata().writeUsage(json.toString())
+        }.onFailure { Log.error("保存表情使用记录失败，保留当前进程内的记录", it) }
     }
 
     private fun readUsageMap(obj: JSONObject?): MutableMap<String, UsageEntry> {
@@ -481,9 +544,7 @@ object ImageFolderStore {
         return ext.isEmpty() || ext in imageExtensions
     }
 
-    private fun ensureFolder(folder: File) {
-        check(folder.isDirectory || folder.mkdirs()) { "无法使用文件夹: ${folder.absolutePath}" }
-    }
+    private fun ensureFolder(folder: File) = ImageDirectoryAccess.ensureDirectory(folder)
 
     private fun sanitizeName(rawName: String): String =
         namePattern.replace(rawName.trim(), "_")

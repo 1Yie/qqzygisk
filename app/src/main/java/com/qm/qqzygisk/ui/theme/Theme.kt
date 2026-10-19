@@ -10,11 +10,15 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.colorResource
 import com.qm.qqzygisk.R
+import com.qm.qqzygisk.hook.parasitic.AppParasitics
 
 @Composable
 private fun resourceColorScheme(darkTheme: Boolean): ColorScheme {
+    // Compose can resolve colors through a configuration context different from Activity's.
+    AppParasitics.ensureModuleAppResources(LocalResources.current)
     val base = if (darkTheme) darkColorScheme() else lightColorScheme()
     return base.copy(
         primary = colorResource(R.color.qqz_primary),

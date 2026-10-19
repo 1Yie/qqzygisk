@@ -15,12 +15,12 @@ plugins {
 }
 
 zygisk {
-    packages("com.tencent.mobileqq")
+    packages("com.tencent.mobileqq", "com.tencent.mm", "com.ss.android.ugc.aweme")
 
     id = "com_qm.qqzygisk"
     name = "qqhook"
     author = "night_star"
-    description = "表情面板同步TG表情包"
+    description = "QQ、微信与抖音本地表情面板"
     entrypoint = "com.qm.qqzygisk.Main"
     archiveName = "qqhook"
     dir = "adb/qqzygisk"
@@ -35,6 +35,7 @@ android {
         applicationId = "com.qm.qqzygisk"
         minSdk = 28
         targetSdk = 36
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 13
         versionName = "1.14"
         ndk.abiFilters.addAll(arrayOf("armeabi-v7a", "arm64-v8a"))
@@ -201,6 +202,7 @@ tasks.withType<Sync>().configureEach {
         from(rootProject.layout.projectDirectory.dir("webroot/dist")) {
             into("webroot")
         }
+        from(layout.projectDirectory.file("src/main/resources/repair-media-permissions.sh"))
         doLast {
             normalizeShellLineEndings(destinationDir)
         }
@@ -255,6 +257,8 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 
 //    implementation(files("libs/runtime-release.aar"))
 }

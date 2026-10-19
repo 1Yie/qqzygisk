@@ -68,6 +68,7 @@ interface ModuleActivity {
          * @see Activity.onCreate
          */
         fun onCreate(savedInstanceState: Bundle?) {
+            AppParasitics.ensureModuleAppResources(selfActivity.resources)
             if (self.moduleTheme != -1)
                 selfActivity.setTheme(self.moduleTheme)
         }
