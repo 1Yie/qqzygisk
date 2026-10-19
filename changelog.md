@@ -1,3 +1,26 @@
+# qqhook v1.16
+
+修复 v1.15 发布包遗漏 Web UI 的问题，恢复模块管理器中的 Web 入口和 QQ Hook 开关页面。保留 v1.15 的微信、抖音支持及现有配置。
+
+## 修复
+
+- 模块安装包重新包含 `webroot/index.html` 及其 JS/CSS 资源，修复 Web 入口消失的问题。
+
+## 构建与兼容性
+
+- 模块打包前自动安装锁定的前端依赖并构建 Web UI；资源缺失时直接终止构建，避免新工作区或干净 CI 环境静默漏包。
+- GitHub Actions 配置 Node.js、pnpm，并检查最终 ZIP 的 Web 资源；修复 Android SDK 初始化仍尝试安装已移除 `tools` 包导致流水线失败的问题。
+
+已安装 v1.15 的用户需整包重装本版模块 ZIP，再重新启动对应宿主。
+
+## 下载
+
+| 平台 | 安装包 | 架构 |
+| --- | --- | --- |
+| Android 9 及以上（Zygisk 模块） | [qqhook.zip](https://github.com/Night-stars-1/qqzygisk/releases/download/v1.16/qqhook.zip) | arm64-v8a、armeabi-v7a |
+
+[完整变更：v1.15...v1.16](https://github.com/Night-stars-1/qqzygisk/compare/v1.15...v1.16)
+
 # qqhook v1.15
 
 本版本将本地图片面板扩展到微信和抖音，并保留 QQ 的文件夹管理与 FunBox 表情迁移功能。各宿主独立保存目录配置和使用记录。

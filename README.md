@@ -28,12 +28,14 @@ QQ 发送前通过统一会话接口实时解析当前联系人，兼容面板�
 
 更新时需整包重装模块 ZIP，再重新启动对应宿主；仅替换 dex 不会执行微信旧目录权限修复。本项目的本地测试和 APK 签名核对无法代替实际收发验证；适配其他抖音版本前需重新核对混淆接口。
 
-本地验证与打包：
+本地验证与打包需要 JDK 21、Android SDK 36、Node.js 22 及 pnpm 11.9.0。Shell 脚本回归需在 POSIX 环境执行（Windows 可使用 WSL）：
 
 ```sh
 python3 -B -m unittest discover -s tests -p 'test_*.py'
 ./gradlew :app:testDebugUnitTest :app:assembleRelease
 ```
+
+Gradle 在打包模块前自动按 `webroot/pnpm-lock.yaml` 安装前端依赖并构建 Web UI；缺少 `webroot/dist/index.html` 或其引用的 JS/CSS 时构建失败，不再依赖工作区残留的 `dist`。GitHub Actions 还会检查最终 ZIP 中的 `webroot/index.html` 及资源文件，发布附件使用该流水线生成的模块包。
 
 ## 鸣谢
 

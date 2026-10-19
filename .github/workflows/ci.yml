@@ -28,16 +28,61 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install SDK packages
         run: |
           sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: webroot/pnpm-lock.yaml
 
       - name: Grant Gradle
         run: chmod +x gradlew
 
       - name: Assemble release module
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify module contains Web UI
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+          import zipfile
+
+          path = "app/build/outputs/magisk/release/qqhook.zip"
+          with zipfile.ZipFile(path) as archive:
+              names = set(archive.namelist())
+              index_name = "webroot/index.html"
+              if index_name not in names:
+                  sys.exit(f"模块 ZIP 缺少 {index_name}")
+              html = archive.read(index_name).decode("utf-8")
+              refs = [
+                  ref
+                  for ref in re.findall(r"""(?:src|href)\s*=\s*["']([^"']+)["']""", html)
+                  if ref.endswith((".js", ".css"))
+                  and not ref.startswith(("http://", "https://", "//", "data:"))
+              ]
+              if not refs:
+                  sys.exit(f"{index_name} 未引用任何本地 JS/CSS")
+              for ref in refs:
+                  entry = "webroot/" + ref.split("?", 1)[0].split("#", 1)[0].lstrip("/").removeprefix("./")
+                  if entry not in names:
+                      sys.exit(f"模块 ZIP 缺少 {entry}")
+                  if archive.getinfo(entry).file_size == 0:
+                      sys.exit(f"模块 ZIP 中的 {entry} 为空")
+              print(f"Web UI 校验通过：{index_name}，引用 {len(refs)} 个 JS/CSS 资源")
+          PY
 
       - name: Upload module zip
         uses: actions/upload-artifact@v4

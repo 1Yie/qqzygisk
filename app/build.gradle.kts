@@ -36,8 +36,8 @@ android {
         minSdk = 28
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 14
-        versionName = "1.15"
+        versionCode = 15
+        versionName = "1.16"
         ndk.abiFilters.addAll(arrayOf("armeabi-v7a", "arm64-v8a"))
     }
 
@@ -197,9 +197,71 @@ fun normalizeShellLineEndings(moduleDir: File) {
         }
 }
 
+val webRootDir = rootProject.layout.projectDirectory.dir("webroot")
+val isWindows = System.getProperty("os.name").lowercase().contains("windows")
+
+/**
+ * 在 webroot 目录下执行 pnpm。Windows 上 pnpm 是 .cmd 脚本，必须经由 cmd /d /c 调用。
+ */
+fun Exec.runPnpm(vararg args: String) {
+    workingDir = webRootDir.asFile
+    if (isWindows) {
+        commandLine("cmd", "/d", "/c", (listOf("pnpm") + args).joinToString(" "))
+    } else {
+        commandLine(*(listOf("pnpm") + args).toTypedArray())
+    }
+}
+
+/**
+ * 校验前端构建产物确实存在且 index.html 引用的本地 JS/CSS 均非空，缺失时直接失败而不是打包空 Web。
+ */
+fun validateWebDist(distDir: File) {
+    val indexHtml = File(distDir, "index.html")
+    check(indexHtml.isFile) {
+        "Web UI 未构建：缺少 ${indexHtml.absolutePath}，请确认 webroot 前端构建成功"
+    }
+    val html = indexHtml.readText(Charsets.UTF_8)
+    val assets = Regex("""(?:src|href)\s*=\s*["']([^"']+)["']""")
+        .findAll(html)
+        .map { it.groupValues[1] }
+        .filter { ref ->
+            !ref.startsWith("http://") && !ref.startsWith("https://") &&
+                !ref.startsWith("//") && !ref.startsWith("data:") && !ref.startsWith("#")
+        }
+        .map { it.substringBefore('?').substringBefore('#').removePrefix("/").removePrefix("./") }
+        .filter { it.endsWith(".js") || it.endsWith(".css") }
+        .toList()
+    check(assets.isNotEmpty()) {
+        "Web UI 产物异常：${indexHtml.absolutePath} 未引用任何本地 JS/CSS"
+    }
+    assets.forEach { relativePath ->
+        val asset = File(distDir, relativePath)
+        check(asset.isFile && asset.length() > 0L) {
+            "Web UI 产物缺失或为空：${asset.absolutePath}"
+        }
+    }
+}
+
+val installWebDependencies = tasks.register<Exec>("installWebDependencies") {
+    group = "web"
+    description = "安装 webroot 前端依赖"
+    runPnpm("install", "--frozen-lockfile")
+}
+
+val buildWebUi = tasks.register<Exec>("buildWebUi") {
+    group = "web"
+    description = "构建 webroot 前端产物"
+    dependsOn(installWebDependencies)
+    runPnpm("run", "build")
+    doLast {
+        validateWebDist(webRootDir.dir("dist").asFile)
+    }
+}
+
 tasks.withType<Sync>().configureEach {
     if (name.startsWith("mergeMagisk")) {
-        from(rootProject.layout.projectDirectory.dir("webroot/dist")) {
+        dependsOn(buildWebUi)
+        from(webRootDir.dir("dist")) {
             into("webroot")
         }
         from(layout.projectDirectory.file("src/main/resources/repair-media-permissions.sh"))
