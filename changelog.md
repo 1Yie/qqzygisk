@@ -1,3 +1,21 @@
+# qqhook v1.18
+
+修复安装或升级模块后，Web 页面中已关闭的 Hook 开关被重新开启的问题。QQ、微信和抖音的现有开关状态均会保留。
+
+## 修复
+
+- 安装或升级模块时保留已有的宿主启用配置，不再用安装包默认值覆盖；关闭全部开关后升级也会保持关闭，首次安装仍使用默认配置。
+
+若开关已被旧版安装流程重新开启，请手动关闭一次；此前的关闭状态无法自动恢复。请整包安装本版模块 ZIP，以更新安装脚本。
+
+## 下载
+
+| 平台 | 安装包 | 架构 |
+| --- | --- | --- |
+| Android 9 及以上（Zygisk 模块） | [qqhook.zip](https://github.com/Night-stars-1/qqzygisk/releases/download/v1.18/qqhook.zip) | arm64-v8a、armeabi-v7a |
+
+[完整变更：v1.17...v1.18](https://github.com/Night-stars-1/qqzygisk/compare/v1.17...v1.18)
+
 # qqhook v1.17
 
 Web 页面新增微信和抖音的独立 Hook 开关，并修复 v1.15 发布包遗漏 Web UI 的问题。保留现有宿主适配与配置，各开关互不影响。

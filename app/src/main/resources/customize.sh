@@ -34,7 +34,12 @@ done
 [ "$DEX_FOUND" = true ] || abort "! No classes*.dex payload found"
 
 [ -d "$MODPATH/packages" ] || abort "! packages directory not found"
-cp -af "$MODPATH/packages" "$PAYLOAD_NEXT/" || abort "! Failed to copy packages"
+if [ -d "$PAYLOAD_DIR/packages" ]; then
+  # An empty directory means all package hooks were disabled in the WebUI.
+  cp -af "$PAYLOAD_DIR/packages" "$PAYLOAD_NEXT/" || abort "! Failed to preserve packages"
+else
+  cp -af "$MODPATH/packages" "$PAYLOAD_NEXT/" || abort "! Failed to copy packages"
+fi
 [ ! -d "$MODPATH/lib" ] || cp -af "$MODPATH/lib" "$PAYLOAD_NEXT/" || abort "! Failed to copy native libraries"
 
 if [ -f "$PAYLOAD_DIR/config.properties" ]; then
