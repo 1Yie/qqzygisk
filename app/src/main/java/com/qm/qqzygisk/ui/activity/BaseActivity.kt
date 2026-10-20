@@ -11,9 +11,14 @@ abstract class BaseActivity : ComponentActivity(), ModuleActivity {
 
     override val moduleTheme get() = R.style.Theme_AppDefault
 
+    /** 本次创建是否从已保存状态恢复（旋转或进程恢复）。 */
+    protected var createdFromSavedState: Boolean = false
+        private set
+
     override fun getClassLoader() = delegate.getClassLoader()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        createdFromSavedState = savedInstanceState != null
         delegate.onCreate(savedInstanceState)
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)

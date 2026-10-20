@@ -1,9 +1,11 @@
 package com.qm.qqzygisk.hook.utils
 
+import android.content.Context
 import android.graphics.ImageDecoder
 import android.graphics.drawable.Animatable
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.view.View
 import android.widget.ImageView
 import java.io.File
@@ -17,6 +19,18 @@ object AnimatedImageLoader {
 
     fun decode(file: File, maxSize: Int): Drawable? =
         decode(ImageDecoder.createSource(file), maxSize, fileLooksAnimated(file.name), file.absolutePath)
+
+    /**
+     * Decodes a document straight from its provider; no thumbnail copy is written to disk.
+     * [nameHint] carries the display name so animated formats without a path can be recognized.
+     */
+    fun decode(context: Context, uri: Uri, maxSize: Int, nameHint: String? = null): Drawable? =
+        decode(
+            ImageDecoder.createSource(context.contentResolver, uri),
+            maxSize,
+            fileLooksAnimated(nameHint ?: uri.lastPathSegment.orEmpty()),
+            uri.toString(),
+        )
 
     fun decode(bytes: ByteArray, maxSize: Int): Drawable? =
         decode(

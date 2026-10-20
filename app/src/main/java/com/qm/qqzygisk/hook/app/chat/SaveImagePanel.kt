@@ -71,20 +71,29 @@ class SaveImagePanel private constructor(
 ) {
     private val colors = PanelColors.from(context)
     private val pending = arrayOfNulls<ImageDownloader.DownloadedImage>(1)
-    private val selected = arrayOfNulls<File>(1)
+    private val selected = arrayOfNulls<ImageEntry>(1)
     private lateinit var titleView: TextView
     private lateinit var folderRow: LinearLayout
 
     /** 上次扫描到的分类列表，切换分类时复用，不重复扫盘。 */
-    private var loadedFolders: List<File> = emptyList()
+    private var loadedFolders: List<ImageEntry> = emptyList()
+    /** 分类显示名与可删除能力在后台一次算好，主线程不再访问 provider。 */
+    private var folderLabels: Map<String, String> = emptyMap()
+    private var deletableFolders: Set<String> = emptySet()
+    /** 授权根是否能新建分类；来自后台查询，未知时禁用新建按钮。 */
+    private var rootWritable = false
     private var imageGrid: GridView? = null
     private var emptyHint: TextView? = null
     private var previewView: ImageView? = null
     private var previewProgress: ProgressBar? = null
     private var panelDialog: Dialog? = null
     private var deleteFolderButton: ImageButton? = null
+    private var createFolderButton: ImageButton? = null
+    private var saveButton: TextView? = null
     private var previewDialog: Dialog? = null
     private var performingAction = false
+    @Volatile
+    private var lastAccessErrorAt = 0L
     private var selectedAction = actions.firstOrNull { it.id == initialActionId }
         ?: actions.firstOrNull()
     private var actionButton: ImageButton? = null
@@ -94,6 +103,12 @@ class SaveImagePanel private constructor(
     private val folderCoverExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "QQZygisk-FolderCover").apply { isDaemon = true }
     }
+    /** 目录枚举、文档复制、保存/删除等磁盘与 provider 访问统一走这里，绝不在主线程做。 */
+    private val ioExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "QQZygisk-ImageIO").apply { isDaemon = true }
+    }
+    @Volatile
+    private var folderGeneration = 0
     private val thumbnailCache = object : LruCache<String, Bitmap>(THUMBNAIL_CACHE_KB) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount / 1024
     }
@@ -117,8 +132,10 @@ class SaveImagePanel private constructor(
             Log.info("[ImageAnim] panel-dismiss generation=$imageGeneration")
             closed = true
             imageGeneration++
+            folderGeneration++
             thumbnailExecutor.shutdownNow()
             folderCoverExecutor.shutdownNow()
+            ioExecutor.shutdownNow()
             thumbnailRequests.clear()
             synchronized(thumbnailCache) { thumbnailCache.evictAll() }
             synchronized(animatedThumbnails) { animatedThumbnails.evictAll() }
@@ -248,12 +265,12 @@ class SaveImagePanel private constructor(
                 isVerticalScrollBarEnabled = false
                 clipToPadding = false
                 onItemClickListener = AdapterView.OnItemClickListener { parent, _, position, _ ->
-                    (parent.adapter.getItem(position) as? File)?.let(::performAction)
+                    (parent.adapter.getItem(position) as? ImageEntry)?.let(::performAction)
                 }
                 onItemLongClickListener = AdapterView.OnItemLongClickListener { parent, _, position, _ ->
-                    val file = parent.adapter.getItem(position) as? File
+                    val entry = parent.adapter.getItem(position) as? ImageEntry
                         ?: return@OnItemLongClickListener false
-                    showEmoticonPreview(file)
+                    showEmoticonPreview(entry)
                     true
                 }
             }
@@ -342,6 +359,10 @@ class SaveImagePanel private constructor(
             root.addView(
                 filledButton("保存", colors.primary, colors.onPrimary) {
                     saveCurrent()
+                }.also {
+                    saveButton = it
+                    it.isEnabled = false
+                    it.alpha = 0.4f
                 },
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -369,46 +390,152 @@ class SaveImagePanel private constructor(
     }
 
     private fun bindFolders() {
-        loadedFolders = ImageFolderStore.folders(includeExternal = browseOnly)
-        if (loadedFolders.isEmpty()) {
+        val generation = ++folderGeneration
+        val includeExternal = browseOnly
+        val submit = runCatching {
+            ioExecutor.execute {
+                val snapshot = runCatching {
+                    val folders = ImageFolderStore.folders(includeExternal = includeExternal)
+                    FolderSnapshot(
+                        folders = folders,
+                        labels = folders.associate { folder ->
+                            folder.key to runCatching { ImageFolderStore.displayName(folder) }
+                                .getOrDefault(folder.name)
+                        },
+                        deletable = folders.filter { folder ->
+                            runCatching { ImageFolderStore.canDelete(folder) }.getOrDefault(false)
+                        }.map { it.key }.toSet(),
+                        lastKey = runCatching { ImageFolderStore.lastFolderFrom(folders) }
+                            .getOrNull()?.key,
+                        rootWritable = runCatching { ImageFolderStore.root().canWrite }
+                            .getOrDefault(false),
+                    )
+                }
+                postToPanel {
+                    if (generation != folderGeneration) return@postToPanel
+                    snapshot.fold(
+                        onSuccess = ::onFoldersLoaded,
+                        onFailure = ::onFoldersFailed,
+                    )
+                }
+            }
+        }
+        submit.onFailure {
+            Log.error("无法调度目录读取", it)
+            onFoldersFailed(it)
+        }
+    }
+
+    private fun onFoldersLoaded(snapshot: FolderSnapshot) {
+        val folders = snapshot.folders
+        loadedFolders = folders
+        folderLabels = snapshot.labels
+        deletableFolders = snapshot.deletable
+        rootWritable = snapshot.rootWritable
+        if (folders.isEmpty()) {
             selected[0] = null
             if (browseOnly) titleView.text = "图片面板"
             folderRow.removeAllViews()
-            folderRow.addView(
-                TextView(context).apply {
-                    text = "还没有文件夹"
-                    setTextColor(colors.muted)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                    setPadding(context.dp(4), context.dp(12), context.dp(4), context.dp(12))
-                },
-            )
-            refreshDeleteFolderButton()
+            folderRow.addView(messageView("还没有文件夹"))
+            refreshFolderActions()
             bindImages(null)
             return
         }
-        if (selected[0] == null || loadedFolders.none { it.absolutePath == selected[0]?.absolutePath }) {
-            selected[0] = ImageFolderStore.lastFolderFrom(loadedFolders)
+        if (selected[0] == null || folders.none { it.key == selected[0]?.key }) {
+            selected[0] = folders.firstOrNull { it.key == snapshot.lastKey }
+                ?: folders.firstOrNull { !ImageFolderStore.isHistoryFolder(it) }
+                ?: folders.firstOrNull()
         }
         renderFolderCards()
         bindImages(selected[0])
+    }
+
+    private fun onFoldersFailed(error: Throwable) {
+        Log.error("读取图片目录失败", error)
+        loadedFolders = emptyList()
+        folderLabels = emptyMap()
+        deletableFolders = emptySet()
+        rootWritable = false
+        selected[0] = null
+        if (browseOnly) titleView.text = "图片面板"
+        val message = panelErrorMessage(error)
+        folderRow.removeAllViews()
+        folderRow.addView(messageView(message))
+        refreshFolderActions()
+        bindImages(null, message)
+    }
+
+    private fun folderLabel(folder: ImageEntry): String =
+        folderLabels[folder.key] ?: folder.name
+
+    /** 授权或 provider 失效时必须明确提示重新授权，不能表现成空目录。 */
+    private fun panelErrorMessage(error: Throwable): String {
+        if (error is ImageAccessException) {
+            return error.message?.takeIf { it.isNotBlank() }
+                ?: "图片目录授权已失效，请在模块设置中重新选择并授权该文件夹"
+        }
+        if (error is SecurityException || error is java.io.FileNotFoundException) {
+            return "图片目录授权已失效，请在模块设置中重新选择并授权该文件夹"
+        }
+        val detail = error.message?.takeIf { it.isNotBlank() }
+        return if (detail == null) {
+            "无法读取图片目录，请在模块设置中重新授权该文件夹"
+        } else {
+            "无法读取图片目录：$detail（可在模块设置中重新授权）"
+        }
+    }
+
+    private fun messageView(text: String): TextView = TextView(context).apply {
+        this.text = text
+        setTextColor(colors.muted)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        setPadding(context.dp(4), context.dp(12), context.dp(4), context.dp(12))
+    }
+
+    private fun postToPanel(action: () -> Unit) {
+        titleView.post {
+            if (!closed) action()
+        }
+    }
+
+    /** 磁盘与 provider 访问在 IO 线程执行，结果只回传仍存活的当前面板。 */
+    private fun <T> submitIo(
+        label: String,
+        onSuccess: (T) -> Unit = {},
+        onFailure: (Throwable) -> Unit = {},
+        block: () -> T,
+    ) {
+        val submit = runCatching {
+            ioExecutor.execute {
+                val result = runCatching { block() }
+                result.onFailure { Log.error("$label 失败", it) }
+                postToPanel {
+                    result.fold(onSuccess = onSuccess, onFailure = onFailure)
+                }
+            }
+        }
+        submit.onFailure { error ->
+            Log.error("无法调度$label", error)
+            onFailure(error)
+        }
     }
 
     /** 只重建分类栏，不重新遍历文件系统（切换分类时用，避免整盘重扫导致卡顿）。 */
     private fun renderFolderCards() {
         folderRow.removeAllViews()
         if (browseOnly) {
-            titleView.text = selected[0]?.let(ImageFolderStore::displayName) ?: "图片面板"
+            titleView.text = selected[0]?.let(::folderLabel) ?: "图片面板"
         }
         loadedFolders.forEach { folder ->
             folderRow.addView(folderCard(folder))
         }
-        refreshDeleteFolderButton()
+        refreshFolderActions()
     }
 
-    private fun folderCard(folder: File): View {
-        val checked = folder.absolutePath == selected[0]?.absolutePath
+    private fun folderCard(folder: ImageEntry): View {
+        val checked = folder.key == selected[0]?.key
         val size = if (browseOnly) context.dp(40) else context.dp(56)
-        val displayName = ImageFolderStore.displayName(folder)
+        val displayName = folderLabel(folder)
         val image = ImageView(context).apply {
             contentDescription = displayName
             scaleType = ImageView.ScaleType.CENTER_CROP
@@ -468,11 +595,11 @@ class SaveImagePanel private constructor(
             }
             setOnClickListener {
                 selected[0] = folder
-                ImageFolderStore.remember(folder)
+                submitIo("记住上次分类") { ImageFolderStore.remember(folder) }
                 renderFolderCards()
                 bindImages(folder)
             }
-            if (ImageFolderStore.canDelete(folder)) {
+            if (folder.key in deletableFolders) {
                 isLongClickable = true
                 setOnLongClickListener {
                     confirmDeleteFolder(folder)
@@ -482,15 +609,50 @@ class SaveImagePanel private constructor(
         }
     }
 
-    private fun bindImages(folder: File?) {
+    private fun bindImages(folder: ImageEntry?, errorText: String? = null) {
         val grid = imageGrid ?: return
         val hint = emptyHint ?: return
         val generation = ++imageGeneration
         grid.adapter = null
-        val files = folder?.let(ImageFolderStore::images).orEmpty()
+        if (folder == null) {
+            hint.text = errorText ?: "还没有文件夹"
+            hint.visibility = View.VISIBLE
+            return
+        }
+        hint.text = "正在加载…"
+        hint.visibility = View.VISIBLE
+        val submit = runCatching {
+            ioExecutor.execute {
+                val result = runCatching { ImageFolderStore.images(folder) }
+                postToPanel {
+                    if (generation != imageGeneration) return@postToPanel
+                    result.fold(
+                        onSuccess = { files -> showImages(grid, hint, files, generation) },
+                        onFailure = { error ->
+                            Log.error("读取分类图片失败: ${folder.key}", error)
+                            hint.text = panelErrorMessage(error)
+                            hint.visibility = View.VISIBLE
+                        },
+                    )
+                }
+            }
+        }
+        submit.onFailure {
+            Log.error("无法调度分类图片读取", it)
+            hint.text = panelErrorMessage(it)
+            hint.visibility = View.VISIBLE
+        }
+    }
+
+    private fun showImages(
+        grid: GridView,
+        hint: TextView,
+        files: List<ImageEntry>,
+        generation: Int,
+    ) {
+        hint.text = "这个文件夹还没有图片"
         hint.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
         if (files.isEmpty()) return
-
         val fill = fill@{
             if (closed || generation != imageGeneration) return@fill
             val gap = context.dp(IMAGE_GAP)
@@ -515,18 +677,18 @@ class SaveImagePanel private constructor(
     }
 
     private inner class ImageGridAdapter(
-        private val files: List<File>,
+        private val files: List<ImageEntry>,
         private val cellSize: Int,
         private val generation: Int,
     ) : BaseAdapter() {
         override fun getCount(): Int = files.size
 
-        override fun getItem(position: Int): File = files[position]
+        override fun getItem(position: Int): ImageEntry = files[position]
 
-        override fun getItemId(position: Int): Long = files[position].absolutePath.hashCode().toLong()
+        override fun getItemId(position: Int): Long = files[position].key.hashCode().toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val file = getItem(position)
+            val entry = getItem(position)
             val image = (convertView as? ImageView) ?: ImageView(context).apply {
                 // Recycled cells must retain GridView's forceAdd and other layout metadata.
                 layoutParams = AbsListView.LayoutParams(cellSize, cellSize)
@@ -536,19 +698,19 @@ class SaveImagePanel private constructor(
                 outlineProvider = roundedOutline(context.dp(12).toFloat())
                 setPadding(context.dp(4), context.dp(4), context.dp(4), context.dp(4))
             }
-            image.contentDescription = "发送 ${file.name}"
-            loadImageThumbnail(file, cellSize, image, generation)
+            image.contentDescription = "发送 ${entry.name}"
+            loadImageThumbnail(entry, cellSize, image, generation)
             return image
         }
     }
 
     private fun loadImageThumbnail(
-        file: File,
+        entry: ImageEntry,
         size: Int,
         image: ImageView,
         generation: Int,
     ) {
-        val key = thumbnailKey(file, size)
+        val key = thumbnailKey(entry, size)
         if (image.tag == key && image.drawable != null) {
             AnimatedImageLoader.bind(image, image.drawable)
             return
@@ -578,7 +740,12 @@ class SaveImagePanel private constructor(
             thumbnailExecutor.execute {
                 try {
                     if (closed || generation != imageGeneration) return@execute
-                    val drawable = AnimatedImageLoader.decode(file, size) ?: return@execute
+                    val drawable = runCatching { decodeEntry(entry, size) }
+                        .onFailure { error ->
+                            Log.warn("解码图片失败: ${entry.key}", error)
+                            reportDecodeAccessError(error)
+                        }
+                        .getOrNull() ?: return@execute
                     if (closed || generation != imageGeneration) return@execute
                     val bitmap = (drawable as? BitmapDrawable)?.bitmap
                     if (bitmap != null) {
@@ -641,18 +808,24 @@ class SaveImagePanel private constructor(
         }
     }
 
-    private fun loadFolderCover(folder: File, size: Int, image: ImageView) {
-        val key = "folder:${folder.absolutePath}:$size"
+    private fun loadFolderCover(folder: ImageEntry, size: Int, image: ImageView) {
+        val key = "folder:${folder.key}:$size"
         image.tag = key
         val target = WeakReference(image)
         runCatching {
             folderCoverExecutor.execute {
                 if (closed) return@execute
-                val cover = ImageFolderStore.coverFile(folder) ?: return@execute
+                val cover = runCatching { ImageFolderStore.coverFile(folder) }.getOrNull()
+                    ?: return@execute
                 val coverKey = thumbnailKey(cover, size)
                 val cachedBitmap = synchronized(thumbnailCache) { thumbnailCache.get(coverKey) }
                 val drawable = if (cachedBitmap == null) {
-                    AnimatedImageLoader.decode(cover, size)
+                    runCatching { decodeEntry(cover, size) }
+                        .onFailure { error ->
+                            Log.warn("解码分类封面失败: ${cover.key}", error)
+                            reportDecodeAccessError(error)
+                        }
+                        .getOrNull()
                 } else {
                     null
                 }
@@ -678,33 +851,104 @@ class SaveImagePanel private constructor(
         }
     }
 
-    private fun thumbnailKey(file: File, size: Int): String =
-        "${file.absolutePath}:${file.lastModified()}:${file.length()}:$size"
+    /**
+     * 文档直接交给 ImageDecoder，不再为缩略图复制文件；真实文件仍走原路径。
+     *
+     * 仅在真正需要新解码（缓存未命中）时校验持久读授权：旧的 ImageEntry 不能借助
+     * 进程内残留的临时授权，在模块授权被清除后继续读取新数据。
+     */
+    private fun decodeEntry(entry: ImageEntry, maxSize: Int): Drawable? {
+        entry.localFile?.let { return AnimatedImageLoader.decode(it, maxSize) }
+        entry.documentUri?.let { uri ->
+            val host = context.applicationContext ?: context
+            if (!ImageEntry.hasPersistedRead(host, entry.key)) {
+                throw ImageAccessException("目录授权已失效，请重新选择授权目录")
+            }
+            return AnimatedImageLoader.decode(context, uri, maxSize, entry.name)
+        }
+        return null
+    }
 
-    private fun performAction(file: File) {
+    /** 解码阶段发现授权被清除时提示重新授权（限制频率，避免缩略图逐张弹窗）。 */
+    private fun reportDecodeAccessError(error: Throwable) {
+        if (error !is ImageAccessException) return
+        val now = System.currentTimeMillis()
+        synchronized(this) {
+            if (now - lastAccessErrorAt < DECODE_ERROR_INTERVAL_MS) return
+            lastAccessErrorAt = now
+        }
+        val message = error.message ?: "目录授权已失效，请重新选择授权目录"
+        titleView.post {
+            if (!closed) Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun thumbnailKey(entry: ImageEntry, size: Int): String =
+        "${entry.key}:${entry.modified}:${entry.size}:$size"
+
+    /**
+     * 只在真正发送的边界把选中的文档实质化成宿主私有文件；列表、缩略图、预览都不复制。
+     */
+    private fun performAction(entry: ImageEntry) {
         val action = selectedAction ?: return
         if (performingAction) return
         performingAction = true
+        val generation = imageGeneration
+        val submit = runCatching {
+            ioExecutor.execute {
+                val materialized = runCatching { ImageSendCache.fileFor(context, entry) }
+                postToPanel {
+                    if (generation != imageGeneration) {
+                        performingAction = false
+                        return@postToPanel
+                    }
+                    materialized.onFailure { error ->
+                        performingAction = false
+                        Log.error("${action.label}失败: ${entry.key}", error)
+                        Toast.makeText(
+                            context,
+                            error.message ?: "${action.label}失败",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }.onSuccess { file -> performActionWithFile(action, entry, file, generation) }
+                }
+            }
+        }
+        submit.onFailure {
+            performingAction = false
+            Log.error("无法调度${action.label}", it)
+            Toast.makeText(context, it.message ?: "${action.label}失败", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun performActionWithFile(
+        action: ImagePanelAction,
+        entry: ImageEntry,
+        file: File,
+        generation: Int,
+    ) {
         val finish: (Result<Unit>) -> Unit = { result ->
             titleView.post {
                 if (!closed) {
                     performImagePanelAction(
                         send = { result },
-                        recordUsage = { ImageFolderStore.recordUsage(file) },
+                        recordUsage = { ImageFolderStore.recordUsage(entry) },
                         onUsageFailure = { Log.error("发送已提交，更新表情历史失败", it) },
                     ).onSuccess {
                         panelDialog?.dismiss()
                     }.onFailure {
                         performingAction = false
-                        Log.error("${action.label}失败: ${file.absolutePath}", it)
-                        Toast.makeText(context, it.message ?: "${action.label}失败", Toast.LENGTH_LONG).show()
+                        Log.error("${action.label}失败: ${entry.key}", it)
+                        Toast.makeText(context, it.message ?: "${action.label}失败", Toast.LENGTH_LONG)
+                            .show()
                     }
                 }
             }
         }
         val async = action.performAsync
+        val active = { !closed && generation == imageGeneration }
         if (async != null) {
-            runCatching { async(file, finish) { !closed } }.onFailure { finish(Result.failure(it)) }
+            runCatching { async(file, finish, active) }.onFailure { finish(Result.failure(it)) }
         } else {
             finish(runCatching { action.perform(file).getOrThrow() })
         }
@@ -719,23 +963,17 @@ class SaveImagePanel private constructor(
         }
     }
 
-    private fun showEmoticonPreview(file: File) {
-        Log.info("[ImageAnim] preview-open source=${file.absolutePath} bytes=${file.length()}")
+    private fun showEmoticonPreview(entry: ImageEntry) {
+        Log.info("[ImageAnim] preview-open source=${entry.key} bytes=${entry.size}")
         traceVisibleThumbnails("before-preview")
         val preview = ImageView(context).apply {
-            tag = "preview:${file.absolutePath}"
+            tag = "preview:${entry.key}"
             scaleType = ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
             background = rounded(colors.preview, context.dp(20).toFloat())
             clipToOutline = true
             outlineProvider = roundedOutline(context.dp(20).toFloat())
             minimumHeight = context.dp(200)
-        }
-        val drawable = AnimatedImageLoader.decode(file, maxSize = 720)
-        if (drawable != null) {
-            AnimatedImageLoader.bind(preview, drawable)
-        } else {
-            preview.setImageResource(android.R.drawable.ic_menu_report_image)
         }
         val content = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -748,40 +986,75 @@ class SaveImagePanel private constructor(
                     context.dp(280),
                 ).apply { bottomMargin = context.dp(20) },
             )
-            addView(
-                filledButton(
-                    "删除",
-                    ContextCompat.getColor(context, R.color.qqz_error),
-                    ContextCompat.getColor(context, R.color.qqz_on_error),
-                ) { confirmDeleteEmoticon(file) },
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    context.dp(48),
-                ),
-            )
+            if (entry.canDelete) {
+                addView(
+                    filledButton(
+                        "删除",
+                        ContextCompat.getColor(context, R.color.qqz_error),
+                        ContextCompat.getColor(context, R.color.qqz_on_error),
+                    ) { confirmDeleteEmoticon(entry) },
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        context.dp(48),
+                    ),
+                )
+            } else {
+                addView(
+                    TextView(context).apply {
+                        text = "该目录为只读授权，不能删除"
+                        setTextColor(colors.muted)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                        gravity = Gravity.CENTER
+                        setPadding(0, context.dp(12), 0, context.dp(12))
+                    },
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ),
+                )
+            }
         }
         previewDialog?.dismiss()
-        previewDialog = MaterialAlertDialogBuilder(context)
+        val dialog = MaterialAlertDialogBuilder(context)
             .setTitle("表情预览")
             .setView(content)
             .create()
-            .also { dialog ->
-                dialog.setOnDismissListener {
-                    AnimatedImageLoader.trace("preview-dismiss", preview)
-                    AnimatedImageLoader.clear(preview)
-                    if (previewDialog === dialog) previewDialog = null
+        previewDialog = dialog
+        dialog.setOnDismissListener {
+            AnimatedImageLoader.trace("preview-dismiss", preview)
+            AnimatedImageLoader.clear(preview)
+            if (previewDialog === dialog) previewDialog = null
+        }
+        dialog.show()
+        submitIo("预览解码") {
+            val drawable = runCatching { decodeEntry(entry, maxSize = 720) }
+                .onFailure { error ->
+                    Log.warn("预览解码失败: ${entry.key}", error)
+                    reportDecodeAccessError(error)
                 }
-                dialog.show()
-                preview.postDelayed({
-                    if (!closed && previewDialog === dialog && dialog.isShowing) {
-                        AnimatedImageLoader.trace("preview-after-1500ms", preview)
-                        traceVisibleThumbnails("grid-after-preview-1500ms")
-                    }
-                }, 1500L)
+                .getOrNull()
+            preview.post {
+                if (closed || previewDialog !== dialog) return@post
+                if (drawable != null) {
+                    AnimatedImageLoader.bind(preview, drawable)
+                } else {
+                    preview.setImageResource(android.R.drawable.ic_menu_report_image)
+                }
             }
+        }
+        preview.postDelayed({
+            if (!closed && previewDialog === dialog && dialog.isShowing) {
+                AnimatedImageLoader.trace("preview-after-1500ms", preview)
+                traceVisibleThumbnails("grid-after-preview-1500ms")
+            }
+        }, 1500L)
     }
 
-    private fun confirmDeleteEmoticon(file: File) {
+    private fun confirmDeleteEmoticon(entry: ImageEntry) {
+        if (!entry.canDelete) {
+            Toast.makeText(context, "该目录为只读授权，不能删除", Toast.LENGTH_SHORT).show()
+            return
+        }
         val message = TextView(context).apply {
             text = "确定删除这个表情？删除后无法恢复。"
             setTextColor(colors.onSurface)
@@ -803,28 +1076,33 @@ class SaveImagePanel private constructor(
             val delete = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
             delete.setTextColor(ContextCompat.getColor(context, R.color.qqz_error))
             delete.setOnClickListener {
-                runCatching {
-                    ImageFolderStore.deleteImage(file)
-                }.onSuccess {
-                    dialog.dismiss()
-                    previewDialog?.dismiss()
-                    bindFolders()
-                    Toast.makeText(context, "已删除", Toast.LENGTH_SHORT).show()
-                }.onFailure {
-                    Log.error("删除表情失败: ${file.absolutePath}", it)
-                    Toast.makeText(context, it.message ?: "删除失败", Toast.LENGTH_SHORT).show()
-                }
+                delete.isEnabled = false
+                submitIo(
+                    "删除表情",
+                    onSuccess = {
+                        dialog.dismiss()
+                        previewDialog?.dismiss()
+                        bindFolders()
+                        Toast.makeText(context, "已删除", Toast.LENGTH_SHORT).show()
+                    },
+                    onFailure = { error ->
+                        delete.isEnabled = true
+                        Log.error("删除表情失败: ${entry.key}", error)
+                        Toast.makeText(context, error.message ?: "删除失败", Toast.LENGTH_SHORT)
+                            .show()
+                    },
+                ) { ImageFolderStore.deleteImage(entry) }
             }
         }
         dialog.show()
     }
 
-    private fun confirmDeleteFolder(folder: File) {
-        if (!ImageFolderStore.canDelete(folder)) {
+    private fun confirmDeleteFolder(folder: ImageEntry) {
+        if (folder.key !in deletableFolders) {
             Toast.makeText(context, "这个文件夹不能删除", Toast.LENGTH_SHORT).show()
             return
         }
-        val name = ImageFolderStore.displayName(folder)
+        val name = folderLabel(folder)
         val message = TextView(context).apply {
             text = "确定删除文件夹「$name」？其中的图片会一起删除，且无法恢复。"
             setTextColor(colors.onSurface)
@@ -846,17 +1124,22 @@ class SaveImagePanel private constructor(
             val delete = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
             delete.setTextColor(ContextCompat.getColor(context, R.color.qqz_error))
             delete.setOnClickListener {
-                runCatching {
-                    ImageFolderStore.deleteFolder(folder)
-                }.onSuccess {
-                    dialog.dismiss()
-                    if (selected[0]?.absolutePath == folder.absolutePath) selected[0] = null
-                    bindFolders()
-                    Toast.makeText(context, "已删除文件夹", Toast.LENGTH_SHORT).show()
-                }.onFailure {
-                    Log.error("删除文件夹失败: ${folder.absolutePath}", it)
-                    Toast.makeText(context, it.message ?: "删除失败", Toast.LENGTH_SHORT).show()
-                }
+                delete.isEnabled = false
+                submitIo(
+                    "删除文件夹",
+                    onSuccess = {
+                        dialog.dismiss()
+                        if (selected[0]?.key == folder.key) selected[0] = null
+                        bindFolders()
+                        Toast.makeText(context, "已删除文件夹", Toast.LENGTH_SHORT).show()
+                    },
+                    onFailure = { error ->
+                        delete.isEnabled = true
+                        Log.error("删除文件夹失败: ${folder.key}", error)
+                        Toast.makeText(context, error.message ?: "删除失败", Toast.LENGTH_SHORT)
+                            .show()
+                    },
+                ) { ImageFolderStore.deleteFolder(folder) }
             }
         }
         dialog.show()
@@ -865,7 +1148,22 @@ class SaveImagePanel private constructor(
     private fun refreshDeleteFolderButton() {
         val folder = selected[0]
         deleteFolderButton?.visibility =
-            if (folder != null && ImageFolderStore.canDelete(folder)) View.VISIBLE else View.GONE
+            if (folder != null && folder.key in deletableFolders) View.VISIBLE else View.GONE
+    }
+
+    /** 统一刷新只读/可写相关的按钮状态：授权失效或只读时禁用全部变更入口。 */
+    private fun refreshFolderActions() {
+        refreshDeleteFolderButton()
+        createFolderButton?.let { button ->
+            button.isEnabled = rootWritable
+            button.alpha = if (rootWritable) 1f else 0.4f
+        }
+        saveButton?.let { button ->
+            val folder = selected[0]
+            val writable = folder != null && folder.canWrite
+            button.isEnabled = writable
+            button.alpha = if (writable) 1f else 0.4f
+        }
     }
 
     private fun deleteFolderButton(): ImageButton {
@@ -1001,15 +1299,22 @@ class SaveImagePanel private constructor(
             inputLayout.error = null
         }
         dialog.setOnShowListener {
-            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
-                runCatching {
-                    selected[0] = ImageFolderStore.createFolder(input.text.toString())
-                    bindFolders()
-                    dialog.dismiss()
-                }.onFailure {
-                    Log.error("创建保存文件夹失败", it)
-                    inputLayout.error = it.message ?: "无法创建文件夹"
-                }
+            val create = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+            create.setOnClickListener {
+                create.isEnabled = false
+                submitIo(
+                    "新建文件夹",
+                    onSuccess = { created ->
+                        selected[0] = created
+                        bindFolders()
+                        dialog.dismiss()
+                    },
+                    onFailure = { error ->
+                        create.isEnabled = true
+                        Log.error("创建保存文件夹失败", error)
+                        inputLayout.error = error.message ?: "无法创建文件夹"
+                    },
+                ) { ImageFolderStore.createFolder(input.text.toString()) }
             }
             input.requestFocus()
             dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
@@ -1028,15 +1333,24 @@ class SaveImagePanel private constructor(
             Toast.makeText(context, "请先选择或新建文件夹", Toast.LENGTH_SHORT).show()
             return
         }
-        runCatching {
-            ImageFolderStore.saveImage(folder, image.bytes, image.extension)
-        }.onSuccess {
-            Toast.makeText(context, "已保存到「${folder.name}」", Toast.LENGTH_SHORT).show()
-            panelDialog?.dismiss()
-        }.onFailure {
-            Log.error("保存聊天图片失败", it)
-            Toast.makeText(context, it.message ?: "保存失败", Toast.LENGTH_SHORT).show()
+        if (!folder.canWrite) {
+            Toast.makeText(context, "该目录为只读授权，无法保存", Toast.LENGTH_SHORT).show()
+            return
         }
+        val folderName = folderLabel(folder)
+        saveButton?.isEnabled = false
+        submitIo(
+            "保存聊天图片",
+            onSuccess = {
+                Toast.makeText(context, "已保存到「$folderName」", Toast.LENGTH_SHORT).show()
+                panelDialog?.dismiss()
+            },
+            onFailure = { error ->
+                saveButton?.isEnabled = true
+                Log.error("保存聊天图片失败", error)
+                Toast.makeText(context, error.message ?: "保存失败", Toast.LENGTH_SHORT).show()
+            },
+        ) { ImageFolderStore.saveImage(folder, image.bytes, image.extension) }
     }
 
     private fun filledButton(
@@ -1065,10 +1379,13 @@ class SaveImagePanel private constructor(
             )
         }.resourceId
         return ImageButton(context).apply {
+            createFolderButton = this
             setImageResource(R.drawable.ic_create_folder)
             setColorFilter(colors.primary)
             setBackgroundResource(selectableBackground)
             contentDescription = "新建文件夹"
+            isEnabled = rootWritable
+            alpha = if (rootWritable) 1f else 0.4f
             val padding = context.dp(12)
             setPadding(padding, padding, padding, padding)
             disableEmptyLongClick()
@@ -1148,6 +1465,7 @@ class SaveImagePanel private constructor(
 
     companion object {
         private const val IMAGE_COLUMNS = 5
+        private const val DECODE_ERROR_INTERVAL_MS = 5000L
         private const val PANEL_HORIZONTAL_PADDING = 12
         private const val FOLDER_COLUMN_WIDTH = 56
         private const val FOLDER_GRID_GAP = 6
@@ -1177,6 +1495,14 @@ class SaveImagePanel private constructor(
         }
     }
 }
+
+private data class FolderSnapshot(
+    val folders: List<ImageEntry>,
+    val labels: Map<String, String>,
+    val deletable: Set<String>,
+    val lastKey: String?,
+    val rootWritable: Boolean,
+)
 
 private fun Context.dp(value: Int): Int =
     (value * resources.displayMetrics.density).toInt()

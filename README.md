@@ -12,13 +12,24 @@ Zygisk 模块：在 QQ、微信和抖音好友私信的聊天表情按钮上长�
 | FunBox | `com.tencent.mobileqq/.fun/Sticker/Storage` | `com.tencent.mm/.fun/Sticker/Storage` | `com.ss.android.ugc.aweme/.fun/Sticker/Storage` |
 | TGStickersExported | `com.tencent.mobileqq/TGStickersExported/v1` | `com.tencent.mm/TGStickersExported/v1` | `com.ss.android.ugc.aweme/TGStickersExported/v1` |
 
-路径可独立修改。FunBox 分类名称从其 Storage 旁的 `packs` 文件读取。请使用当前宿主能访问的目录。
+三类来源均可独立填写本地路径，或通过“选择目录”取得 SAF 目录授权。FunBox 分类名称优先读取授权范围内可访问的 `packs` 文件，无法读取时使用文件夹名。
 
-历史使用记录保存在当前宿主私有的 `files/qqzygisk/image-panel` 中，按图片根目录区分。升级时会读取可访问的旧 `.usage.json`，后续更新只写私有存储；上次选择的分类通过宿主 SharedPreferences 保存。图片来源可只读，使用记录写入失败不会使已提交的发送报错、重试或导致宿主退出。
+**让微信只访问 QQ 的图片目录：**
+
+1. 从微信内部进入 **设置 → QQ Zygisk → 表情目录**，不要在模块管理器或独立模块应用中授权；授权必须属于当前宿主 UID。
+2. 在图片目录框填入 `/storage/emulated/0/Android/media/com.tencent.mobileqq/.qqzygisk`，点击该字段旁的 **选择目录**。
+3. 在系统目录选择器中确认选中的是 `.qqzygisk` 本身，再点 **使用此文件夹** 并允许访问；不要误选上级目录。
+4. 返回后点击 **保存路径**，再重新打开图片面板。配置会保存系统返回的 `content://` 目录 URI，而不是将其转换成绝对路径读取。QQ、抖音及另外两类图片来源使用相同流程。
+
+该流程不申请“管理所有文件”或额外媒体权限，仅新增所选目录及子目录的授权；宿主原有的其他权限不会自动撤销。授权属于整个宿主应用，不只属于模块代码。系统只授予读权限或提供方不支持写入时，仍可浏览、预览和发送，修改操作按能力限制；授权丢失时必须重新选择，不会静默退回旧路径。取消选择不会覆盖配置，改用默认路径后需保存才会释放不再使用的模块授权。
+
+原生接口必须使用文件路径时，按需将请求的图片写入宿主私有 `files/qqzygisk/send-cache`；撤销目录授权不会回收已发送或已缓存的图片。平铺图片目录也会作为分类显示，但授权根目录本身不能删除。FunBox 迁移保留源文件；若来源与目标重叠，或提供方无法可靠确认目录关系，会拒绝迁移，避免向来源内部递归复制。
+
+历史使用记录保存在当前宿主私有的 `files/qqzygisk/image-panel` 中，按来源身份（本地路径或授权 URI）区分；改选 URI 不会删除原路径的记录。本地路径模式继续兼容可访问的旧 `.usage.json`，后续更新只写私有存储；上次选择的分类通过宿主 SharedPreferences 保存。历史始终记录原始图片身份，不记录发送缓存路径。图片来源可只读，使用记录写入失败不会使已提交的发送报错、重试或导致宿主退出。
 
 QQ 发送前通过统一会话接口实时解析当前联系人，兼容面板添加的关闭保护包装。聊天切换、根视图失效或面板关闭时仍拒绝发送，不使用全局缓存联系人作为兜底。会话不可用时日志会标出绑定、根视图和 AIO 数据就绪状态，不记录联系人标识。
 
-曾经的安装版本把微信 `.qqzygisk` 目录改为应用 UID 和应用组、权限 0700，可能阻断 Android 媒体服务访问，造成面板和文件管理器都无法创建目录。本版安装时会在底层 `/data/media/<用户>/Android/media/com.tencent.mm/.qqzygisk` 恢复应用 UID、`media_rw` 组和媒体目录权限，并恢复安全标签；保留已有图片。修复限于这个旧目录，不会改动微信其他数据或用户配置的其他路径。若仍无法创建，面板会显示失败的完整路径及错误类型。
+安装过程不会遍历或改写用户 `Android/media` 图库的属主、访问权限或 SELinux 标签。若遇到目录访问异常，应先检查当前宿主的 SAF 授权和实际错误，再针对性诊断，不默认递归执行 `chown`／`chmod`。
 
 微信 8.0.79 的「设置」页提供 **QQ Zygisk** 入口。微信面板默认使用原生表情发送：调用微信本地表情导入接口，校验原始 MD5、缓存大小和 GIF 类型后，通过原生 `sendEmoji` 链路提交。无扩展名 GIF 也按文件头识别，发送前不转换为静态 Bitmap。导入或校验失败时提示错误，用户可在发送方式菜单中手动选择普通图片模式。
 
@@ -26,18 +37,23 @@ QQ 发送前通过统一会话接口实时解析当前联系人，兼容面板�
 
 点击图片后，模块准备本地文件并直接提交抖音原生图片任务，由抖音处理上传和发送。抖音表情消息构造、收藏创建、自定义上传和原图地址解析流程均已移除。旧版保存的表情发送偏好不再使用。模块仍会在提交前校验原聊天，避免页面关闭或切换后误发；GIF 是否保留动画由抖音原生图片流程决定。
 
-更新时需整包重装模块 ZIP，再重新启动对应宿主；仅替换 dex 不会执行微信旧目录权限修复。本项目的本地测试和 APK 签名核对无法代替实际收发验证；适配其他抖音版本前需重新核对混淆接口。
+更新时需整包重装模块 ZIP，按模块管理器提示重启手机后再启动对应宿主。本项目的本地测试和 APK 签名核对无法代替实际收发验证；适配其他抖音版本前需重新核对混淆接口。
 
 模块管理器的 Web 设置页提供 QQ、微信、抖音三个独立 Hook 开关，分别控制对应宿主；修改后需重启对应应用生效。各开关独立加载并显示错误，修改失败时保留原状态。
 
-本地验证与打包需要 JDK 21、Android SDK 36、Node.js 22 及 pnpm 11.9.0。Shell 脚本回归需在 POSIX 环境执行（Windows 可使用 WSL）：
+本地验证与打包需要 JDK 21、Android SDK 36、Node.js 22 及 pnpm 11.9.0：
 
 ```sh
-python3 -B -m unittest discover -s tests -p 'test_*.py'
 ./gradlew :app:testDebugUnitTest :app:assembleRelease
 ```
 
 Gradle 在打包模块前自动按 `webroot/pnpm-lock.yaml` 安装前端依赖并构建 Web UI；缺少 `webroot/dist/index.html` 或其引用的 JS/CSS 时构建失败，不再依赖工作区残留的 `dist`。GitHub Actions 还会检查最终 ZIP 中的 `webroot/index.html` 及资源文件，发布附件使用该流水线生成的模块包。
+
+SAF Android 端到端测试会操作真实系统目录选择器，并在 QQ 媒体目录内创建、清理独立测试子目录；请仅连接临时测试模拟器运行，模拟器需支持 `arm64-v8a` 或对应转译：
+
+```sh
+./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.qm.qqzygisk.saf.SafDirectoryFlowTest
+```
 
 ## 鸣谢
 

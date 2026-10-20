@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+          Fixture provider lives in the androidTest APK, i.e. in a different UID than the
+          target app under test. The target can only reach it through a real persisted URI
+          grant obtained from the system DocumentsUI, never through a same-UID shortcut.
+        -->
+        <provider
+            android:name="com.qm.qqzygisk.saf.SafFixtureProvider"
+            android:authorities="com.qm.qqzygisk.saf.fixture"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:label="SAF Fixture"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.DOCUMENT_PROVIDER"
+                android:value="true" />
+        </provider>
+    </application>
+
+</manifest>

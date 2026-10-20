@@ -1,5 +1,7 @@
 package com.qm.qqzygisk.hook.app.chat
 
+import android.net.Uri
+import android.provider.DocumentsContract
 import com.qm.qqzygisk.hook.app.host.HostType
 import com.qm.qqzygisk.hook.parasitic.AppParasitics
 import com.qm.qqzygisk.hook.utils.HookSettings
@@ -7,6 +9,7 @@ import com.qm.qqzygisk.hook.utils.Log
 import com.qm.qqzygisk.hook.utils.ModuleUtils
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -14,8 +17,12 @@ import java.util.concurrent.CopyOnWriteArrayList
  * 聊天长按保存图片的本地目录。
  * 子文件夹会作为表情面板分组，第一张图默认当封面。
  * 浏览时还会带上模块内置贴纸目录。
+ *
+ * 三个来源都可能是绝对路径，也可能是 ACTION_OPEN_DOCUMENT_TREE 返回的 tree URI。
+ * URI 不会经过 File/路径归一化；授权失效时明确抛 [ImageAccessException]，
+ * 绝不静默退回旧路径或假装空目录。
  */
-object ImageFolderStore {
+internal object ImageFolderStore {
     const val QQ_ZYGISK_PATH_KEY = "qq_zygisk_image_path"
     const val WECHAT_ZYGISK_PATH_KEY = "wx_zygisk_image_path"
     const val DOUYIN_ZYGISK_PATH_KEY = "douyin_zygisk_image_path"
@@ -56,11 +63,15 @@ object ImageFolderStore {
 
     private const val LAST_FOLDER_FILE = ".last_folder"
     private const val LAST_FOLDER_KEY = "emoticon_panel_last_folder"
+    private const val HISTORY_KEY_SUFFIX = "#__history__"
     const val HISTORY_DIR_NAME = "__history__"
     const val HISTORY_LIMIT_KEY = "history_limit"
     const val DEFAULT_HISTORY_LIMIT = 80
     const val MIN_HISTORY_LIMIT = 1
     const val MAX_HISTORY_LIMIT = 500
+    private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
+    private const val PRIMARY_DOCUMENT_PREFIX = "primary:"
+    private const val PRIMARY_STORAGE_ROOT = "/storage/emulated/0"
     private val usageLock = Any()
     @Volatile
     private var usageCache: UsageStore? = null
@@ -70,6 +81,8 @@ object ImageFolderStore {
     private val imageExtensions = setOf("png", "jpg", "jpeg", "gif", "webp")
     @Volatile
     private var funBoxNameCache = FunBoxNameCache()
+    @Volatile
+    private var funBoxEntryCache: Pair<String, ImageEntry?>? = null
 
     fun addListener(listener: () -> Unit) {
         listeners.add(listener)
@@ -79,42 +92,94 @@ object ImageFolderStore {
         listeners.forEach { it() }
     }
 
-    fun root(): File = File(ROOT_PATH).apply {
-        runCatching { ImageDirectoryAccess.ensureDirectory(this) }
-            .onFailure { Log.error("表情根目录不可用: $absolutePath", it) }
+    /**
+     * 配置的图片根。文档来源必须是仍持有持久读授权的真实目录；
+     * 真实文件来源保持原来的「不存在就创建」行为。
+     */
+    fun root(): ImageEntry {
+        val source = ROOT_PATH
+        if (ImageEntry.isDocumentSource(source)) {
+            val entry = ImageEntry.from(source)
+            if (!entry.exists()) throw ImageAccessException("图片目录不可用，请重新选择授权目录")
+            return entry
+        }
+        val directory = File(source)
+        runCatching { ImageDirectoryAccess.ensureDirectory(directory) }
+            .onFailure { Log.error("表情根目录不可用: ${directory.absolutePath}", it) }
+        return ImageEntry.fromFile(directory)
     }
 
-    fun isOwned(folder: File): Boolean =
-        folder.absolutePath.startsWith(root().absolutePath + "/")
+    fun isOwned(folder: ImageEntry): Boolean {
+        val root = root()
+        val local = folder.localFile
+        if (local != null) {
+            val rootFile = root.localFile ?: return false
+            val base = rootFile.absolutePath.trimEnd('/')
+            val path = local.absolutePath
+            return path == base || path.startsWith("$base/")
+        }
+        var current: ImageEntry? = folder
+        var depth = 0
+        while (current != null && depth < 64) {
+            if (current.key == root.key) return true
+            val parent = current.parentKey ?: return false
+            current = runCatching { ImageEntry.from(parent) }.getOrNull()
+            depth++
+        }
+        return false
+    }
 
-    fun historyFolder(): File = File(root(), HISTORY_DIR_NAME)
+    fun historyFolder(): ImageEntry {
+        val root = root()
+        val key = root.localFile?.let { File(it, HISTORY_DIR_NAME).absolutePath }
+            ?: (root.key + HISTORY_KEY_SUFFIX)
+        return ImageEntry.virtual(key, HISTORY_DIR_NAME)
+    }
 
     fun historyLimit(): Int =
         HookSettings.getInt(HISTORY_LIMIT_KEY, DEFAULT_HISTORY_LIMIT)
             .coerceIn(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT)
 
-    fun isHistoryFolder(folder: File): Boolean = folder.name == HISTORY_DIR_NAME
+    fun isHistoryFolder(folder: ImageEntry): Boolean = folder.name == HISTORY_DIR_NAME
 
-    fun folders(includeExternal: Boolean = false): List<File> {
-        val owned = listChildFolders(root())
+    private fun isHistoryKey(key: String): Boolean =
+        key.endsWith(HISTORY_KEY_SUFFIX) || key.substringAfterLast('/') == HISTORY_DIR_NAME
+
+    fun folders(includeExternal: Boolean = false): List<ImageEntry> {
+        val root = root()
+        val rootChildren = root.children()
+        val owned = buildList<ImageEntry> {
+            // 选中的目录本身也可能直接放图片（没有子分类）；必须作为不可删除的分类出现。
+            if (rootChildren.any(::isReadableImage)) add(root)
+            rootChildren.filterTo(this) { it.isDirectory && it.name != HISTORY_DIR_NAME && !it.name.startsWith(".") }
+        }
         val extra = if (includeExternal) {
             SCAN_ROOTS.asSequence()
                 .filter { it != ROOT_PATH }
-                .map(::File)
-                .filter { it.isDirectory && it.canRead() }
-                .flatMap { listChildFolders(it).asSequence() }
-                // 外部目录里没有可读图片的分组不展示：系统可能放行列目录、却拒绝读文件，
-                // 过滤掉这些分组，避免出现一排点进去全空、切换还卡顿的分类。
-                .filter(::hasReadableImage)
+                .mapNotNull { externalRoot(it) }
+                .flatMap { source ->
+                    val children = source.children()
+                    val result = mutableListOf<ImageEntry>()
+                    if (children.any(::isReadableImage)) result += source
+                    // 外部目录里没有可读图片的分组不展示：系统可能放行列目录、却拒绝读文件，
+                    // 过滤掉这些分组，避免出现一排点进去全空、切换还卡顿的分类。
+                    children.filterTo(result) { child ->
+                        child.isDirectory &&
+                            child.name != HISTORY_DIR_NAME &&
+                            !child.name.startsWith(".") &&
+                            hasReadableImage(child)
+                    }
+                    result.asSequence()
+                }
                 .toList()
         } else {
             emptyList()
         }
         val real = (owned + extra)
-            .distinctBy { it.absolutePath }
+            .distinctBy { it.key }
             .filter { !isHistoryFolder(it) }
             .sortedWith(
-                compareByDescending<File> { folderUsage(it) }
+                compareByDescending<ImageEntry> { folderUsage(it) }
                     .thenBy { displayName(it).lowercase() },
             )
         if (isWeChat) {
@@ -123,169 +188,224 @@ object ImageFolderStore {
         return if (includeExternal) listOf(historyFolder()) + real else real
     }
 
-    fun images(folder: File): List<File> {
+    /** 外部来源只在缺失时跳过；已配置的 URI 授权失效仍然明确抛出。 */
+    private fun externalRoot(source: String): ImageEntry? {
+        val entry = ImageEntry.from(source)
+        return entry.takeIf { it.isDirectory }
+    }
+
+    fun images(folder: ImageEntry): List<ImageEntry> {
         if (isHistoryFolder(folder)) return historyImages()
-        return folder.listFiles()
-            ?.filter { it.isFile && isImageFile(it) }
-            ?.sortedByDescending { it.lastModified() }
-            ?: emptyList()
+        if (!folder.isDirectory) return emptyList()
+        return folder.children()
+            .filter { it.isFile && isImageEntry(it) }
+            .sortedByDescending { it.modified }
     }
 
-    fun coverFile(folder: File): File? {
+    fun coverFile(folder: ImageEntry): ImageEntry? {
         if (isHistoryFolder(folder)) return historyImages().firstOrNull()
-        return folder.listFiles()
-            ?.asSequence()
-            ?.filter { it.isFile && isImageFile(it) }
-            ?.minByOrNull { it.lastModified() }
+        if (!folder.isDirectory) return null
+        return folder.children()
+            .asSequence()
+            .filter { it.isFile && isImageEntry(it) }
+            .minByOrNull { it.modified }
     }
 
-    fun displayName(folder: File): String {
+    fun displayName(folder: ImageEntry): String {
         if (isHistoryFolder(folder)) return "历史"
-        val storagePath = sourcePaths.funBox
-        if (folder.parentFile?.absolutePath != File(storagePath).absolutePath) return folder.name
-        return funBoxPackNames(storagePath)[folder.name]?.takeIf { it.isNotBlank() } ?: folder.name
+        val funBox = funBoxEntry(sourcePaths.funBox)
+        if (funBox == null || folder.parentKey != funBox.key) return folder.name
+        return funBoxPackNames(funBox)[folder.name]?.takeIf { it.isNotBlank() } ?: folder.name
     }
 
-    fun recordUsage(file: File) {
-        if (!file.isFile || !isImageFile(file)) return
+    fun recordUsage(item: ImageEntry) {
+        if (!item.isFile || !isImageEntry(item)) return
         val now = System.currentTimeMillis()
+        val parentKey = item.parentKey ?: item.localFile?.parentFile?.absolutePath
         synchronized(usageLock) {
             val store = loadUsageLocked()
-            bump(store.files, file.absolutePath, now)
-            val parent = file.parentFile
-            if (parent != null && !isHistoryFolder(parent)) {
-                bump(store.folders, parent.absolutePath, now)
+            bump(store.files, item.key, now, parentKey)
+            if (parentKey != null && !isHistoryKey(parentKey)) {
+                bump(store.folders, parentKey, now, null)
             }
             saveUsageLocked(store)
         }
         notifyChanged()
     }
 
-    fun folderUsage(folder: File): Int {
+    fun folderUsage(folder: ImageEntry): Int {
         if (isHistoryFolder(folder)) return 0
         return synchronized(usageLock) {
-            loadUsageLocked().folders[folder.absolutePath]?.count ?: 0
+            loadUsageLocked().folders[folder.key]?.count ?: 0
         }
     }
 
-    fun lastFolderFrom(available: List<File>): File? {
-        val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank {
-            // 目录可能属于别的宿主（微信读 QQ 的 Android/media 会被 EACCES 拒绝），
-            // 读失败只能当作没记录，绝不能让面板直接打开失败。
-            runCatching {
-                File(root(), LAST_FOLDER_FILE)
-                    .takeIf { it.isFile }
-                    ?.readText()
-                    ?.trim()
-            }.getOrNull().orEmpty()
+    fun lastFolderFrom(available: List<ImageEntry>): ImageEntry? {
+        val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank { readLastFolderMarker() }
+        if (saved.isEmpty()) {
+            // 没有记录时优先真实分类：扁平授权目录只有一个根分类，不能默认落在空的历史页。
+            return available.firstOrNull { !isHistoryFolder(it) } ?: available.firstOrNull()
         }
-        if (saved.isEmpty()) return available.firstOrNull()
-        return available.firstOrNull { it.absolutePath == saved }
+        return available.firstOrNull { it.key == saved }
             ?: available.firstOrNull { it.name == saved }
             ?: available.firstOrNull()
     }
+
+    private fun readLastFolderMarker(): String = runCatching {
+        root().findChild(LAST_FOLDER_FILE)
+            ?.takeIf { it.isFile }
+            ?.inputStream()
+            ?.bufferedReader()
+            ?.use { it.readText() }
+            ?.trim()
+    }.getOrNull().orEmpty()
 
     /**
      * 目录里是否存在**真的能打开**的图片。
      *
-     * 只判断 canRead() 不够：跨应用访问 `Android/media/<其它包>` 时系统可能放行列目录、
+     * 只判断可读标志不够：跨应用访问 `Android/media/<其它包>` 时系统可能放行列目录、
      * 却拒绝读文件，必须真开一次流才能确认，否则会出现一排点进去全空的分类。
      */
-    private fun hasReadableImage(folder: File): Boolean {
-        val candidate = folder.listFiles()
-            ?.firstOrNull { it.isFile && isImageFile(it) }
-            ?: return false
-        return runCatching { java.io.FileInputStream(candidate).close() }.isSuccess
+    private fun hasReadableImage(folder: ImageEntry): Boolean =
+        folder.children().any(::isReadableImage)
+
+    /** 真的能打开一次流才算可读：跨应用目录可能列得出文件却拒绝读取。 */
+    private fun isReadableImage(entry: ImageEntry): Boolean {
+        if (!entry.isFile || !isImageEntry(entry)) return false
+        return runCatching { entry.inputStream().close() }.isSuccess
     }
 
-    fun lastFolder(includeExternal: Boolean = false): File? {
-        val available = folders(includeExternal)
-        val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank {
-            runCatching {
-                File(ROOT_PATH, LAST_FOLDER_FILE)
-                    .takeIf { it.isFile }
-                    ?.readText()
-                    ?.trim()
-            }.getOrNull().orEmpty()
-        }
-        if (saved.isEmpty()) return available.firstOrNull()
-        return available.firstOrNull { it.absolutePath == saved }
-            ?: available.firstOrNull { it.name == saved }
-            ?: available.firstOrNull()
+    fun remember(folder: ImageEntry) {
+        HookSettings.setString(LAST_FOLDER_KEY, folder.key)
     }
 
-    fun remember(folder: File) {
-        HookSettings.setString(LAST_FOLDER_KEY, folder.absolutePath)
-    }
-
-    fun createFolder(rawName: String): File {
+    fun createFolder(rawName: String): ImageEntry {
         val name = sanitizeName(rawName)
         check(name.isNotEmpty() && name != HISTORY_DIR_NAME && name != "历史") { "文件夹名无效" }
-        val folder = ImageDirectoryAccess.createFolder(File(ROOT_PATH), name)
+        val root = root()
+        if (root.localFile == null && !root.canWrite) {
+            throw ImageAccessException("目录授权只读，无法新建分类")
+        }
+        val folder = root.createDirectory(name)
         remember(folder)
         notifyChanged()
         return folder
     }
 
-    fun canDelete(folder: File): Boolean {
+    fun canDelete(folder: ImageEntry): Boolean {
         if (!folder.isDirectory || isHistoryFolder(folder)) return false
-        val parent = folder.parentFile ?: return false
-        return parent.absolutePath == root().absolutePath && isOwned(folder)
+        val root = root()
+        if (root.key == folder.key) return false
+        if (folder.parentKey != root.key) return false
+        return isOwned(folder) && folder.canDelete
     }
 
-    fun deleteFolder(folder: File) {
+    fun deleteFolder(folder: ImageEntry) {
         check(canDelete(folder)) { "只能删除模块自己的文件夹" }
-        val rootPath = root().absolutePath
-        deleteTree(folder, rootPath)
-        val prefix = folder.absolutePath.trimEnd('/', '\\') + File.separator
+        val root = root()
+        check(folder.key != root.key) { "不能删除选中的授权目录" }
+        // 顶部句柄可能来自旧 UI 快照：SAF 目录先按当前 provider 状态重新解析。
+        val target = if (folder.localFile != null) folder else refreshForDeletion(folder, root)
+        // 先完整枚举并验证所有后代，任何一项不能删除就在改动前失败；
+        // 这份顺序（后序）同时用于实际删除和 usage 精确 key 清理，避免二次遍历。
+        val plan = mutableListOf<ImageEntry>()
+        collectDeletionPlan(target, plan)
+        for (entry in plan) {
+            check(entry.delete()) { "无法删除文件夹: ${entry.name}" }
+        }
+        val removed = plan.mapTo(mutableSetOf()) { it.key }
         synchronized(usageLock) {
             val store = loadUsageLocked()
-            store.folders.remove(folder.absolutePath)
-            store.files.keys.removeAll { it.startsWith(prefix) }
+            store.folders.keys.removeAll(removed)
+            store.files.keys.removeAll(removed)
+            store.files.entries.removeAll { entry -> entry.value.parentKey?.let { it in removed } == true }
+            // 真实文件来源才允许按路径前缀清理旧记录；URI 只能依赖上面枚举出的精确 key。
+            val local = folder.localFile
+            if (local != null) {
+                val prefix = local.absolutePath.trimEnd('/', '\\') + File.separator
+                store.files.keys.removeAll { it.startsWith(prefix) }
+            }
             saveUsageLocked(store)
         }
-        if (HookSettings.getString(LAST_FOLDER_KEY, "") == folder.absolutePath) {
+        if (HookSettings.getString(LAST_FOLDER_KEY, "") == folder.key) {
             HookSettings.setString(LAST_FOLDER_KEY, "")
         }
         runCatching {
-            val marker = File(root(), LAST_FOLDER_FILE)
-            if (marker.isFile && marker.readText().trim() == folder.absolutePath) marker.delete()
+            val marker = root.findChild(LAST_FOLDER_FILE)?.takeIf { it.isFile } ?: return@runCatching
+            val text = marker.inputStream().bufferedReader().use { it.readText() }.trim()
+            if (text == folder.key) marker.delete()
         }
         notifyChanged()
     }
 
-    private fun deleteTree(file: File, rootPath: String) {
-        val path = file.absolutePath
-        check(path == rootPath || path.startsWith(rootPath + File.separator)) {
-            "拒绝删除模块目录之外的文件"
+    /** 用当前 provider 状态重新解析待删的 SAF 目录，避免旧快照掩盖撤销的授权。 */
+    private fun refreshForDeletion(folder: ImageEntry, root: ImageEntry): ImageEntry {
+        val fresh = ImageEntry.from(folder.key, parentKey = folder.parentKey)
+        check(fresh.isDirectory) { "文件夹已不存在: ${folder.name}" }
+        check(fresh.key != root.key && fresh.parentKey == root.key) { "只能删除模块自己的文件夹" }
+        if (!fresh.canDelete) {
+            throw ImageAccessException("目录只读或不支持删除，无法删除：${fresh.name}")
         }
-        if (file.isDirectory) {
-            file.listFiles()?.forEach { deleteTree(it, rootPath) }
+        return fresh
+    }
+
+    /**
+     * 后序收集整个子树；对每个 SAF 文档先验证当前持久授权与 provider 删除能力，
+     * 任何一项不满足都在发生删除前抛出。真实文件分支保持原有行为。
+     */
+    private fun collectDeletionPlan(entry: ImageEntry, plan: MutableList<ImageEntry>) {
+        if (entry.localFile == null && !entry.canDelete) {
+            throw ImageAccessException("目录只读或不支持删除，无法删除：${entry.name}")
         }
-        check(file.delete()) { "无法删除文件夹: ${file.name}" }
+        if (entry.isDirectory) entry.children().forEach { collectDeletionPlan(it, plan) }
+        plan += entry
     }
 
     data class FunBoxMigration(val packs: Int, val copied: Int, val skipped: Int)
 
     /**
      * 把 FunBox 表情包复制到 QQ Zygisk 目录。按 packs 里的名称建文件夹，不删除源文件。
+     * 两端都接受绝对路径或 SAF tree URI。
      */
     fun migrateFunBoxToQqZygisk(funBoxPath: String, qqZygiskPath: String): FunBoxMigration {
         val funBox = funBoxPath.trim()
         val qqZygisk = qqZygiskPath.trim()
         check(funBox.isNotEmpty() && qqZygisk.isNotEmpty()) { "目录不能为空" }
-        val sourceRoot = File(funBox).canonicalFile
-        val destRoot = File(qqZygisk).canonicalFile
+        val sourceRoot = ImageEntry.from(funBox)
+        val destRoot = ImageEntry.from(qqZygisk)
         check(sourceRoot.isDirectory) { "FunBox 目录不存在" }
-        check(sourceRoot != destRoot) { "FunBox 目录和 QQ Zygisk 目录相同" }
-        check(!sourceRoot.path.startsWith(destRoot.path + File.separator)) {
-            "FunBox 目录不能位于 QQ Zygisk 目录里面"
+
+        val sourceLocal = sourceRoot.localFile
+        val destLocal = destRoot.localFile
+        if (sourceLocal != null && destLocal != null) {
+            val canonicalSource = sourceLocal.canonicalFile
+            val canonicalDest = destLocal.canonicalFile
+            check(canonicalSource != canonicalDest) { "FunBox 目录和 QQ Zygisk 目录相同" }
+            check(!canonicalSource.path.startsWith(canonicalDest.path + File.separator)) {
+                "FunBox 目录不能位于 QQ Zygisk 目录里面"
+            }
+            check(!canonicalDest.path.startsWith(canonicalSource.path + File.separator)) {
+                "QQ Zygisk 目录不能位于 FunBox 目录里面"
+            }
+        } else {
+            when (directoryRelation(sourceRoot, destRoot)) {
+                DirectoryRelation.SAME ->
+                    error("FunBox 目录和 QQ Zygisk 目录相同")
+                DirectoryRelation.SOURCE_CONTAINS_DEST ->
+                    error("QQ Zygisk 目录不能位于 FunBox 目录里面")
+                DirectoryRelation.DEST_CONTAINS_SOURCE ->
+                    error("FunBox 目录不能位于 QQ Zygisk 目录里面")
+                DirectoryRelation.DISJOINT -> Unit
+            }
         }
-        check(!destRoot.path.startsWith(sourceRoot.path + File.separator)) {
-            "QQ Zygisk 目录不能位于 FunBox 目录里面"
+
+        if (destLocal != null) {
+            check(destRoot.isDirectory || destLocal.mkdirs()) { "无法创建 QQ Zygisk 目录" }
+        } else {
+            check(destRoot.isDirectory) { "无法创建 QQ Zygisk 目录" }
         }
-        check(destRoot.isDirectory || destRoot.mkdirs()) { "无法创建 QQ Zygisk 目录" }
-        val names = funBoxPackNames(sourceRoot.path)
+
+        val names = funBoxPackNames(sourceRoot)
         val usedNames = mutableSetOf<String>()
         var packs = 0
         var copied = 0
@@ -295,8 +415,8 @@ object ImageFolderStore {
             if (images.isEmpty()) continue
             val display = names[pack.name]?.takeIf { it.isNotBlank() } ?: pack.name
             val folderName = migrationFolderName(display, pack.name, usedNames) ?: continue
-            val dest = File(destRoot, folderName)
-            check(dest.isDirectory || dest.mkdirs()) { "无法创建文件夹: $folderName" }
+            val dest = existingChild(destRoot, folderName) ?: destRoot.createDirectory(folderName)
+            check(dest.isDirectory) { "无法创建文件夹: $folderName" }
             packs++
             for (image in images) {
                 if (placeImage(dest, image)) copied++ else skipped++
@@ -324,99 +444,306 @@ object ImageFolderStore {
         return name
     }
 
-    private fun collectImages(pack: File): List<File> {
-        val root = pack.canonicalFile
-        val images = mutableListOf<File>()
-        fun walk(dir: File) {
-            dir.listFiles()?.forEach { child ->
-                val canonical = runCatching { child.canonicalFile }.getOrNull() ?: return@forEach
-                val inside = canonical == root || canonical.path.startsWith(root.path + File.separator)
-                if (!inside) return@forEach
+    private enum class DirectoryRelation {
+        SAME,
+        SOURCE_CONTAINS_DEST,
+        DEST_CONTAINS_SOURCE,
+        DISJOINT,
+    }
+
+    /**
+     * 复制前确定两端目录的真实包含关系，避免把生成的包再次复制进自己。
+     *
+     * - 同一 provider 的文档：先比较 authority + document ID，再用
+     *   [DocumentsContract.isChildDocument] 询问 provider；provider 无法确认时明确失败。
+     * - 标准 ExternalStorageProvider 的 `primary:` 文档与普通路径：只用已知的
+     *   primary 存储映射做字符串比较，不猜测任意 provider 路径，不做文件 IO、不扩大权限。
+     * - 其他无法确认的情况抛 [IllegalStateException]，绝不假设互不包含。
+     */
+    private fun directoryRelation(source: ImageEntry, dest: ImageEntry): DirectoryRelation =
+        establishRelation(source, dest)
+            ?: throw IllegalStateException("无法确认 FunBox 目录与 QQ Zygisk 目录的包含关系，请改选其他目录")
+
+    private fun establishRelation(source: ImageEntry, dest: ImageEntry): DirectoryRelation? {
+        val sourcePath = primaryPath(source)
+        val destPath = primaryPath(dest)
+        if (sourcePath != null && destPath != null) return pathRelation(sourcePath, destPath)
+
+        val sourceUri = source.documentUri
+        val destUri = dest.documentUri
+        if (sourceUri == null || destUri == null) return null
+        if (!sourceUri.authority.equals(destUri.authority, ignoreCase = true)) return null
+        val sourceId = documentId(source) ?: return null
+        val destId = documentId(dest) ?: return null
+        if (sourceId == destId) return DirectoryRelation.SAME
+
+        val resolver = AppParasitics.appContext?.contentResolver ?: return null
+        // 用真实的已知子项验证 provider 实现了后代语义；不能用自身当探针，
+        // strict-descendant provider 对 parent == child 会返回 false。
+        // 空目录没有后代，可以直接判否，不需要 provider 支持。
+        val sourceChildren = source.children()
+        if (sourceChildren.isNotEmpty()) {
+            val witness = firstDocumentUri(sourceChildren) ?: return null
+            if (!DocumentsContract.isChildDocument(resolver, sourceUri, witness)) return null
+            if (DocumentsContract.isChildDocument(resolver, sourceUri, destUri)) {
+                return DirectoryRelation.SOURCE_CONTAINS_DEST
+            }
+        }
+        val destChildren = dest.children()
+        if (destChildren.isNotEmpty()) {
+            val witness = firstDocumentUri(destChildren) ?: return null
+            if (!DocumentsContract.isChildDocument(resolver, destUri, witness)) return null
+            if (DocumentsContract.isChildDocument(resolver, destUri, sourceUri)) {
+                return DirectoryRelation.DEST_CONTAINS_SOURCE
+            }
+        }
+        return DirectoryRelation.DISJOINT
+    }
+
+    private fun firstDocumentUri(children: List<ImageEntry>): Uri? =
+        children.firstNotNullOfOrNull { it.documentUri }
+
+    private fun documentId(entry: ImageEntry): String? =
+        entry.documentUri?.let { runCatching { DocumentsContract.getDocumentId(it) }.getOrNull() }
+
+    /**
+     * 已知的 primary 存储映射：标准 ExternalStorageProvider 的 `primary:<relative>`
+     * 与 `/storage/emulated/0/<relative>` 等价；`/storage/self/primary` 和 `/sdcard`
+     * 只是同一位置的别名。仅用于比较，不访问文件系统。
+     */
+    private fun primaryPath(entry: ImageEntry): String? {
+        entry.localFile?.let { return normalizePrimaryPath(it.absolutePath) }
+        val uri = entry.documentUri ?: return null
+        if (!uri.authority.equals(EXTERNAL_STORAGE_AUTHORITY, ignoreCase = true)) return null
+        val id = documentId(entry) ?: return null
+        if (!id.startsWith(PRIMARY_DOCUMENT_PREFIX)) return null
+        val relative = id.removePrefix(PRIMARY_DOCUMENT_PREFIX).trim('/')
+        return normalizePrimaryPath(
+            if (relative.isEmpty()) PRIMARY_STORAGE_ROOT else "$PRIMARY_STORAGE_ROOT/$relative",
+        )
+    }
+
+    private fun normalizePrimaryPath(path: String): String {
+        val alias = when {
+            path == "/storage/self/primary" -> PRIMARY_STORAGE_ROOT
+            path.startsWith("/storage/self/primary/") ->
+                PRIMARY_STORAGE_ROOT + path.removePrefix("/storage/self/primary")
+            path == "/sdcard" -> PRIMARY_STORAGE_ROOT
+            path.startsWith("/sdcard/") -> PRIMARY_STORAGE_ROOT + path.removePrefix("/sdcard")
+            else -> path
+        }
+        val segments = ArrayDeque<String>()
+        for (segment in alias.replace('\\', '/').split('/')) {
+            when (segment) {
+                "", "." -> Unit
+                ".." -> if (segments.isNotEmpty()) segments.removeLast()
+                else -> segments.addLast(segment)
+            }
+        }
+        return "/" + segments.joinToString("/")
+    }
+
+    private fun pathRelation(sourcePath: String, destPath: String): DirectoryRelation = when {
+        sourcePath == destPath -> DirectoryRelation.SAME
+        isUnder(destPath, sourcePath) -> DirectoryRelation.SOURCE_CONTAINS_DEST
+        isUnder(sourcePath, destPath) -> DirectoryRelation.DEST_CONTAINS_SOURCE
+        else -> DirectoryRelation.DISJOINT
+    }
+
+    private fun isUnder(path: String, ancestor: String): Boolean =
+        path.startsWith(ancestor.trimEnd('/') + "/")
+
+    private fun collectImages(pack: ImageEntry): List<ImageEntry> {
+        val images = mutableListOf<ImageEntry>()
+        val local = pack.localFile
+        if (local != null) {
+            val root = local.canonicalFile
+            fun walk(dir: File) {
+                dir.listFiles()?.forEach { child ->
+                    val canonical = runCatching { child.canonicalFile }.getOrNull() ?: return@forEach
+                    val inside = canonical == root || canonical.path.startsWith(root.path + File.separator)
+                    if (!inside) return@forEach
+                    when {
+                        canonical.isDirectory && !canonical.name.startsWith(".") -> walk(canonical)
+                        canonical.isFile && isImageName(canonical.name) -> images.add(ImageEntry.fromFile(canonical))
+                    }
+                }
+            }
+            walk(root)
+            return images
+        }
+        fun walk(entry: ImageEntry) {
+            entry.children().forEach { child ->
                 when {
-                    canonical.isDirectory && !canonical.name.startsWith(".") -> walk(canonical)
-                    canonical.isFile && isImageFile(canonical) -> images.add(canonical)
+                    child.isDirectory && !child.name.startsWith(".") -> walk(child)
+                    child.isFile && isImageName(child.name) -> images.add(child)
                 }
             }
         }
-        walk(root)
+        walk(pack)
         return images
     }
 
-    private fun placeImage(destDir: File, source: File): Boolean {
-        val preferred = File(destDir, source.name)
-        if (preferred.canonicalFile == source.canonicalFile) return false
-        if (!preferred.exists()) {
-            source.copyTo(preferred)
-            return true
-        }
-        if (preferred.length() == source.length()) return false
-        val ext = source.extension
-        val base = source.nameWithoutExtension.ifEmpty { source.name }
-        for (index in 2..1000) {
-            val name = if (ext.isEmpty()) "${base}_$index" else "${base}_$index.$ext"
-            val candidate = File(destDir, name)
-            if (!candidate.exists()) {
-                source.copyTo(candidate)
-                return true
+    private fun placeImage(destDir: ImageEntry, source: ImageEntry): Boolean {
+        val preferred = existingChild(destDir, source.name)
+        if (preferred != null) {
+            if (sameFile(preferred, source)) return false
+            if (sameSize(preferred, source)) return false
+            val dot = source.name.lastIndexOf('.')
+            val extension = if (dot > 0) source.name.substring(dot + 1) else ""
+            val base = if (dot > 0) source.name.substring(0, dot).ifEmpty { source.name } else source.name
+            for (index in 2..1000) {
+                val name = if (extension.isEmpty()) "${base}_$index" else "${base}_$index.$extension"
+                val candidate = existingChild(destDir, name)
+                if (candidate == null) {
+                    copyImage(destDir, source, name)
+                    return true
+                }
+                if (sameSize(candidate, source)) return false
             }
-            if (candidate.length() == source.length()) return false
+            error("无法写入: ${source.name}")
         }
-        error("无法写入: ${source.name}")
+        copyImage(destDir, source, source.name)
+        return true
     }
 
-    fun saveImage(folder: File, bytes: ByteArray, extension: String): File {
+    private fun sameFile(first: ImageEntry, second: ImageEntry): Boolean {
+        if (first.key == second.key) return true
+        val firstLocal = first.localFile ?: return false
+        val secondLocal = second.localFile ?: return false
+        return runCatching { firstLocal.canonicalFile == secondLocal.canonicalFile }.getOrDefault(false)
+    }
+
+    private fun sameSize(first: ImageEntry, second: ImageEntry): Boolean =
+        first.size >= 0 && second.size >= 0 && first.size == second.size
+
+    private fun existingChild(directory: ImageEntry, name: String): ImageEntry? {
+        val local = directory.localFile
+        if (local != null) {
+            val child = File(local, name)
+            return if (child.exists()) ImageEntry.fromFile(child) else null
+        }
+        return directory.findChild(name)
+    }
+
+    private fun copyImage(destDir: ImageEntry, source: ImageEntry, name: String) {
+        val local = destDir.localFile
+        if (local != null) {
+            ImageDirectoryAccess.ensureDirectory(local)
+            val target = File(local, name)
+            try {
+                FileOutputStream(target).use { output ->
+                    source.inputStream().use { input -> input.copyTo(output) }
+                }
+            } catch (error: Throwable) {
+                target.delete()
+                throw error
+            }
+            return
+        }
+        val mime = ImageEntry.mimeTypeOf(name) ?: "application/octet-stream"
+        val target = destDir.createFile(name, mime)
+        try {
+            target.outputStream().use { output ->
+                source.inputStream().use { input -> input.copyTo(output) }
+            }
+        } catch (error: Throwable) {
+            runCatching { target.delete() }
+            throw error
+        }
+    }
+
+    fun saveImage(folder: ImageEntry, bytes: ByteArray, extension: String): ImageEntry {
         check(isOwned(folder)) { "只能保存到模块自己的文件夹" }
-        ensureFolder(folder)
-        val file = File(folder, "${md5(bytes)}.${normalizeExtension(extension)}")
-        val created = !file.exists()
-        if (created) file.writeBytes(bytes)
+        val normalized = normalizeExtension(extension)
+        val name = "${md5(bytes)}.$normalized"
+        val local = folder.localFile
+        if (local != null) {
+            ImageDirectoryAccess.ensureDirectory(local)
+            val file = File(local, name)
+            val created = !file.exists()
+            if (created) file.writeBytes(bytes)
+            remember(folder)
+            if (created) notifyChanged()
+            return ImageEntry.fromFile(file)
+        }
+        if (!folder.canWrite) throw ImageAccessException("目录授权只读，无法保存图片")
         remember(folder)
-        if (created) notifyChanged()
-        return file
+        val existing = folder.findChild(name)
+        if (existing != null && existing.isFile) return existing
+        val target = folder.createFile(name, ImageEntry.mimeTypeOf(name) ?: "image/jpeg")
+        try {
+            target.outputStream().use { it.write(bytes) }
+        } catch (error: Throwable) {
+            runCatching { target.delete() }
+            throw error
+        }
+        notifyChanged()
+        return target
     }
 
-    fun deleteImage(file: File) {
-        check(file.isFile && isImageFile(file)) { "不是可删除的表情文件" }
-        check(file.delete()) { "无法删除表情" }
+    fun deleteImage(item: ImageEntry) {
+        check(item.isFile && isImageEntry(item)) { "不是可删除的表情文件" }
+        check(item.delete()) { "无法删除表情" }
         synchronized(usageLock) {
             val store = loadUsageLocked()
-            store.files.remove(file.absolutePath)
+            store.files.remove(item.key)
             saveUsageLocked(store)
         }
         notifyChanged()
     }
 
-    private fun listChildFolders(dir: File): List<File> =
-        dir.listFiles()
-            ?.filter { it.isDirectory && !it.name.startsWith(".") && it.name != HISTORY_DIR_NAME }
-            .orEmpty()
-            .toList()
+    private fun listChildFolders(dir: ImageEntry): List<ImageEntry> =
+        dir.children()
+            .filter { it.isDirectory && !it.name.startsWith(".") && it.name != HISTORY_DIR_NAME }
 
-    private fun historyImages(): List<File> {
-        val entries = synchronized(usageLock) { loadUsageLocked().files.entries.toList() }
+    private fun historyImages(): List<ImageEntry> {
+        val entries = synchronized(usageLock) { loadUsageLocked().files.entries.map { it.key to it.value } }
         return entries
             .sortedWith(
-                compareByDescending<Map.Entry<String, UsageEntry>> { it.value.count }
-                    .thenByDescending { it.value.lastUsed },
+                compareByDescending<Pair<String, UsageEntry>> { it.second.count }
+                    .thenByDescending { it.second.lastUsed },
             )
-            .map { File(it.key) }
-            .filter { it.isFile && isImageFile(it) }
+            .asSequence()
+            .mapNotNull { (key, usage) ->
+                val entry = runCatching {
+                    if (ImageEntry.isDocumentSource(key)) {
+                        ImageEntry.from(key, parentKey = usage.parentKey)
+                    } else {
+                        ImageEntry.fromFile(File(key))
+                    }
+                }.onFailure { Log.warn("历史图片来源不可用: $key", it) }.getOrNull()
+                entry?.takeIf { it.isFile && isImageEntry(it) }
+            }
             .take(historyLimit())
+            .toList()
     }
 
-    private fun bump(map: MutableMap<String, UsageEntry>, key: String, now: Long) {
+    private fun bump(
+        map: MutableMap<String, UsageEntry>,
+        key: String,
+        now: Long,
+        parentKey: String?,
+    ) {
         val current = map[key]
         if (current == null) {
-            map[key] = UsageEntry(1, now)
+            map[key] = UsageEntry(1, now, parentKey)
         } else {
             current.count += 1
             current.lastUsed = now
+            if (parentKey != null) current.parentKey = parentKey
         }
     }
 
     private fun metadata(): ImagePanelMetadata {
         val context = checkNotNull(AppParasitics.appContext) { "宿主 Application 尚未初始化" }
-        return ImagePanelMetadata(context.filesDir, File(ROOT_PATH))
+        val raw = ROOT_PATH
+        val document = ImageEntry.isDocumentSource(raw)
+        // 真实文件来源必须沿用旧实现 `File(ROOT_PATH).absolutePath` 的摘要，
+        // 否则旧 .usage.json 的使用记录文件名会变化、历史直接丢失。
+        val identity = if (document) raw else File(raw).absolutePath
+        val legacy = if (document) null else File(raw)
+        return ImagePanelMetadata(context.filesDir, identity, legacy)
     }
 
     private fun loadUsageLocked(): UsageStore {
@@ -455,6 +782,7 @@ object ImageFolderStore {
             result[key] = UsageEntry(
                 count = item.optInt("c"),
                 lastUsed = item.optLong("t"),
+                parentKey = item.optString("p").takeIf { it.isNotBlank() && it != "null" },
             )
         }
         return result
@@ -463,32 +791,40 @@ object ImageFolderStore {
     private fun writeUsageMap(map: Map<String, UsageEntry>): JSONObject {
         val obj = JSONObject()
         map.forEach { (key, entry) ->
-            obj.put(
-                key,
-                JSONObject().put("c", entry.count).put("t", entry.lastUsed),
-            )
+            val item = JSONObject().put("c", entry.count).put("t", entry.lastUsed)
+            entry.parentKey?.let { item.put("p", it) }
+            obj.put(key, item)
         }
         return obj
     }
 
-    private fun funBoxPackNames(storagePath: String): Map<String, String> {
-        val packsFile = findFunBoxPacksFile(storagePath) ?: return emptyMap()
+    private fun funBoxEntry(source: String): ImageEntry? {
+        funBoxEntryCache?.takeIf { it.first == source }?.let { return it.second }
+        val entry = runCatching { ImageEntry.from(source) }.getOrNull()
+        funBoxEntryCache = source to entry
+        return entry
+    }
+
+    private fun funBoxPackNames(storage: ImageEntry): Map<String, String> {
+        val packsFile = findFunBoxPacksFile(storage) ?: return emptyMap()
         val cached = funBoxNameCache
         if (
-            cached.path == packsFile.absolutePath &&
-            cached.lastModified == packsFile.lastModified() &&
-            cached.length == packsFile.length()
+            cached.key == packsFile.key &&
+            cached.lastModified == packsFile.modified &&
+            cached.length == packsFile.size
         ) {
             return cached.names
         }
 
-        val raw = packsFile.readText()
+        val raw = runCatching {
+            packsFile.inputStream().bufferedReader().use { it.readText() }
+        }.getOrNull() ?: return emptyMap()
         val names = runCatching { parseFunBoxPackList(raw) }
             .getOrElse { parseFunBoxPackListFallback(raw) }
         funBoxNameCache = FunBoxNameCache(
-            path = packsFile.absolutePath,
-            lastModified = packsFile.lastModified(),
-            length = packsFile.length(),
+            key = packsFile.key,
+            lastModified = packsFile.modified,
+            length = packsFile.size,
             names = names,
         )
         return names
@@ -524,27 +860,40 @@ object ImageFolderStore {
             .replace("\\\\", "\\")
     }
 
-    private fun findFunBoxPacksFile(storagePath: String): File? {
-        val stickerRoot = File(storagePath).parentFile ?: return null
-        val direct = File(stickerRoot, "packs")
-        if (direct.isFile) return direct
-        return stickerRoot.listFiles()
-            ?.asSequence()
-            ?.filter(File::isDirectory)
-            ?.map { File(it, "packs") }
-            ?.firstOrNull(File::isFile)
+    private fun findFunBoxPacksFile(storage: ImageEntry): ImageEntry? {
+        val local = storage.localFile
+        if (local != null) {
+            val stickerRoot = local.parentFile ?: return null
+            val direct = File(stickerRoot, "packs")
+            if (direct.isFile) return ImageEntry.fromFile(direct)
+            return stickerRoot.listFiles()
+                ?.asSequence()
+                ?.filter(File::isDirectory)
+                ?.map { File(it, "packs") }
+                ?.firstOrNull(File::isFile)
+                ?.let { ImageEntry.fromFile(it) }
+        }
+        val parentKey = storage.parentKey ?: return null
+        val stickerRoot = runCatching { ImageEntry.from(parentKey) }.getOrNull() ?: return null
+        val children = runCatching { stickerRoot.children() }.getOrNull() ?: return null
+        children.firstOrNull { it.isFile && it.name == "packs" }?.let { return it }
+        for (child in children) {
+            if (!child.isDirectory) continue
+            val packs = runCatching { child.findChild("packs") }.getOrNull()
+            if (packs != null && packs.isFile) return packs
+        }
+        return null
     }
 
-    private fun isImageFile(file: File): Boolean {
-        val name = file.name
+    private fun isImageEntry(entry: ImageEntry): Boolean = isImageName(entry.name)
+
+    private fun isImageName(name: String): Boolean {
         if (name.startsWith(".") || name.startsWith("__cover__.") || name.endsWith(".txt.jpg")) {
             return false
         }
-        val ext = file.extension.lowercase()
+        val ext = name.substringAfterLast('.', "").lowercase()
         return ext.isEmpty() || ext in imageExtensions
     }
-
-    private fun ensureFolder(folder: File) = ImageDirectoryAccess.ensureDirectory(folder)
 
     private fun sanitizeName(rawName: String): String =
         namePattern.replace(rawName.trim(), "_")
@@ -567,7 +916,11 @@ object ImageFolderStore {
         }
     }
 
-    private data class UsageEntry(var count: Int, var lastUsed: Long)
+    private data class UsageEntry(
+        var count: Int,
+        var lastUsed: Long,
+        var parentKey: String? = null,
+    )
 
     private data class UsageStore(
         val files: MutableMap<String, UsageEntry> = mutableMapOf(),
@@ -575,7 +928,7 @@ object ImageFolderStore {
     )
 
     private data class FunBoxNameCache(
-        val path: String = "",
+        val key: String = "",
         val lastModified: Long = Long.MIN_VALUE,
         val length: Long = Long.MIN_VALUE,
         val names: Map<String, String> = emptyMap(),

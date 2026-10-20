@@ -2,5 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <activity android:name="com.qm.qqzygisk.testing.DialogProbeActivity" android:exported="false" />
+        <activity
+            android:name="com.qm.qqzygisk.testing.SafGrantProbeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:exported="false"
+            android:theme="@style/Theme.AppDefault" />
     </application>
 </manifest>

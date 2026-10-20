@@ -89,11 +89,4 @@ place_module_apk com.tencent.mobileqq
 place_module_apk com.tencent.mm
 place_module_apk com.ss.android.ugc.aweme
 
-# 旧版本曾将微信媒体目录改成 appUid:appUid/0700，阻断 FUSE 媒体服务访问。
-# 在原始 /data/media 路径恢复权限，保留目录中的所有图片。
-[ -f "$MODPATH/repair-media-permissions.sh" ] || abort "! Media permission repair script missing"
-if ! /system/bin/sh "$MODPATH/repair-media-permissions.sh"; then
-  ui_print "! WeChat media permission repair incomplete; check the installer output above"
-fi
-
 rm -rf "$MODPATH/customize.d"

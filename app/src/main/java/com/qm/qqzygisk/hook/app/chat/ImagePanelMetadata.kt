@@ -7,16 +7,30 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
-/** Panel bookkeeping stays in private storage, even when image sources are read-only. */
-internal class ImagePanelMetadata(privateFiles: File, private val imageRoot: File) {
+/**
+ * 面板使用记录始终保存在宿主私有目录。
+ *
+ * 源身份可以是绝对路径或 SAF tree/document URI；真实文件来源继续使用绝对路径的
+ * SHA-256，保证旧使用记录文件名逐字节兼容。旧 `<图片目录>/.usage.json` 只在真实文件
+ * 来源下读取，绝不再写入所选目录。
+ */
+internal class ImagePanelMetadata(
+    privateFiles: File,
+    sourceIdentity: String,
+    private val legacyImageRoot: File? = null,
+) {
     private val directory = File(privateFiles, "qqzygisk/image-panel")
     private val sourceId = MessageDigest.getInstance("SHA-256")
-        .digest(imageRoot.absolutePath.toByteArray(Charsets.UTF_8))
+        .digest(sourceIdentity.toByteArray(Charsets.UTF_8))
         .joinToString("") { "%02x".format(it.toInt() and 0xff) }
     internal val usageFile = File(directory, "$sourceId.usage.json")
 
     fun readUsage(): String? {
-        for (file in listOf(usageFile, File(imageRoot, ".usage.json"))) {
+        val candidates = buildList {
+            add(usageFile)
+            legacyImageRoot?.let { add(File(it, ".usage.json")) }
+        }
+        for (file in candidates) {
             val text = runCatching { file.takeIf(File::isFile)?.readText() }.getOrNull()
             if (!text.isNullOrBlank()) return text
         }

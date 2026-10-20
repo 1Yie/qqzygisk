@@ -264,7 +264,6 @@ tasks.withType<Sync>().configureEach {
         from(webRootDir.dir("dist")) {
             into("webroot")
         }
-        from(layout.projectDirectory.file("src/main/resources/repair-media-permissions.sh"))
         doLast {
             normalizeShellLineEndings(destinationDir)
         }
@@ -321,6 +320,7 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
 
 //    implementation(files("libs/runtime-release.aar"))
 }

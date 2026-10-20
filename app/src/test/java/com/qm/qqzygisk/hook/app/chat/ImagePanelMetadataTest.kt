@@ -14,7 +14,7 @@ class ImagePanelMetadataTest {
     fun `writing usage never creates metadata in the image source`() {
         val privateFiles = temporary.newFolder("private-files")
         val images = temporary.newFolder("images")
-        val metadata = ImagePanelMetadata(privateFiles, images)
+        val metadata = ImagePanelMetadata(privateFiles, images.absolutePath)
         metadata.writeUsage("{\"files\":{},\"folders\":{}}")
         assertTrue(metadata.usageFile.canonicalFile.toPath().startsWith(privateFiles.canonicalFile.toPath()))
         assertTrue(metadata.usageFile.isFile)
@@ -27,7 +27,7 @@ class ImagePanelMetadataTest {
         val privateFiles = temporary.newFolder("private-files")
         val images = temporary.newFolder("images")
         val old = File(images, ".usage.json").apply { writeText("legacy-history") }
-        val metadata = ImagePanelMetadata(privateFiles, images)
+        val metadata = ImagePanelMetadata(privateFiles, images.absolutePath, images)
         assertEquals("legacy-history", metadata.readUsage())
         metadata.writeUsage("updated-history")
         assertEquals("legacy-history", old.readText())
@@ -39,19 +39,19 @@ class ImagePanelMetadataTest {
         val privateFiles = temporary.newFolder("private-files")
         val firstImages = temporary.newFolder("first")
         val secondImages = temporary.newFolder("second")
-        val first = ImagePanelMetadata(privateFiles, firstImages)
-        val second = ImagePanelMetadata(privateFiles, secondImages)
+        val first = ImagePanelMetadata(privateFiles, firstImages.absolutePath)
+        val second = ImagePanelMetadata(privateFiles, secondImages.absolutePath)
         first.writeUsage("first-history")
         second.writeUsage("second-history")
         assertNotEquals(first.usageFile, second.usageFile)
-        assertEquals("first-history", ImagePanelMetadata(privateFiles, firstImages).readUsage())
-        assertEquals("second-history", ImagePanelMetadata(privateFiles, secondImages).readUsage())
+        assertEquals("first-history", ImagePanelMetadata(privateFiles, firstImages.absolutePath).readUsage())
+        assertEquals("second-history", ImagePanelMetadata(privateFiles, secondImages.absolutePath).readUsage())
     }
 
     @Test
     fun `atomic replacement leaves no temporary metadata files`() {
         val privateFiles = temporary.newFolder("private-files")
-        val metadata = ImagePanelMetadata(privateFiles, temporary.newFolder("images"))
+        val metadata = ImagePanelMetadata(privateFiles, temporary.newFolder("images").absolutePath)
         metadata.writeUsage("before")
         metadata.writeUsage("after")
         assertEquals("after", metadata.readUsage())
@@ -63,7 +63,7 @@ class ImagePanelMetadataTest {
         val privateFiles = temporary.newFile("blocked-private-root")
         val images = temporary.newFolder("images")
         val old = File(images, ".usage.json").apply { writeText("keep") }
-        val metadata = ImagePanelMetadata(privateFiles, images)
+        val metadata = ImagePanelMetadata(privateFiles, images.absolutePath, images)
         var dismissed = false
         var reported: Throwable? = null
         val result = performImagePanelAction(
