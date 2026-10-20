@@ -12,6 +12,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.attribute.BasicFileAttributes
 
 /**
  * 图片目录授权失效，或 SAF 文档无法读写。
@@ -65,7 +67,10 @@ internal sealed class ImageEntry {
 
     abstract fun exists(): Boolean
 
-    /** 一次 query 取回全部子项名称/类型/大小/时间/权限。 */
+    /**
+     * 枚举子项。真实文件只枚举目录项名称；每个子项的类型/大小/时间在首次读取时
+     * 用一次 stat 取回，构造句柄本身不做文件系统调用。
+     */
     abstract fun children(): List<ImageEntry>
 
     abstract fun findChild(name: String): ImageEntry?
@@ -112,7 +117,8 @@ internal sealed class ImageEntry {
             return openDocument(host, value, parentKey)
         }
 
-        fun fromFile(file: File): ImageEntry = FileImageEntry(file.absoluteFile)
+        fun fromFile(file: File): ImageEntry =
+            FileImageEntry(if (file.isAbsolute) file else file.absoluteFile)
 
         /** 用于历史等虚拟分类；不能创建、删除或枚举真实文档。 */
         fun virtual(key: String, name: String): ImageEntry = VirtualImageEntry(key, name)
@@ -241,18 +247,88 @@ internal sealed class ImageEntry {
 }
 
 private class FileImageEntry(val file: File) : ImageEntry() {
-    override val key: String = file.absolutePath
+    override val key: String = file.path
     override val name: String = file.name
-    override val parentKey: String? = file.parentFile?.absolutePath
+
+    // 直接取 File 已保存的父路径字符串，不为只用于拼 key 的父目录创建一个 File。
+    override val parentKey: String? = file.parent
     override val localFile: File = file
     override val documentUri: Uri? = null
-    override val isDirectory: Boolean = file.isDirectory
-    override val isFile: Boolean = file.isFile
-    override val canWrite: Boolean = file.canWrite()
-    override val canDelete: Boolean = file.parentFile?.canWrite() == true && file.exists()
-    override val size: Long = if (file.isFile) file.length() else -1L
-    override val modified: Long = if (file.exists()) file.lastModified() else 0L
-    override val mimeType: String? = ImageEntry.mimeTypeOf(file.name)
+    override val mimeType: String? = ImageEntry.mimeTypeOf(name)
+
+    /**
+     * 首次访问类型/大小/时间时用一次 `stat` 取回全部属性。
+     *
+     * [metadataLoaded] 是发布标记：先写完各字段，再写这个 volatile 字段；其它线程
+     * 看到 true 时必然看到完整快照。首次读取在锁内完成，并发访问最多真正 stat 一次。
+     */
+    @Volatile
+    private var metadataLoaded = false
+    private var metadataExists = false
+    private var metadataDirectory = false
+    private var metadataRegular = false
+    private var metadataSize = -1L
+    private var metadataModified = 0L
+
+    private fun ensureMetadata() {
+        if (metadataLoaded) return
+        synchronized(this) {
+            if (metadataLoaded) return
+            var exists = false
+            var directory = false
+            var regular = false
+            var size = -1L
+            var modified = 0L
+            try {
+                val attributes = Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
+                exists = true
+                directory = attributes.isDirectory
+                regular = attributes.isRegularFile
+                size = attributes.size()
+                modified = attributes.lastModifiedTime().toMillis()
+            } catch (_: IOException) {
+                // 与 File.isDirectory/isFile/length/lastModified 一致：不存在或不可读即 false/-1/0。
+            }
+            metadataExists = exists
+            metadataDirectory = directory
+            metadataRegular = regular
+            metadataSize = size
+            metadataModified = modified
+            metadataLoaded = true
+        }
+    }
+
+    override val isDirectory: Boolean
+        get() {
+            ensureMetadata()
+            return metadataDirectory
+        }
+
+    override val isFile: Boolean
+        get() {
+            ensureMetadata()
+            return metadataRegular
+        }
+
+    /** 与旧的 `if (isFile) length() else -1` 一致；目录、特殊文件或缺失为 -1。 */
+    override val size: Long
+        get() {
+            ensureMetadata()
+            return if (metadataRegular) metadataSize else -1L
+        }
+
+    /** 与旧的 `if (exists()) lastModified() else 0` 一致；缺失或不可读为 0。 */
+    override val modified: Long
+        get() {
+            ensureMetadata()
+            return metadataModified
+        }
+
+    /** 写能力只在实际需要时检查，扫描/排序不为每个目录项多付一次 access。 */
+    override val canWrite: Boolean get() = file.canWrite()
+
+    override val canDelete: Boolean
+        get() = file.parentFile?.canWrite() == true && file.exists()
 
     override fun exists(): Boolean = file.exists()
 
@@ -261,8 +337,27 @@ private class FileImageEntry(val file: File) : ImageEntry() {
             ?.map { ImageEntry.fromFile(it) }
             .orEmpty()
 
-    override fun findChild(name: String): ImageEntry? =
-        file.listFiles()?.firstOrNull { it.name == name }?.let { ImageEntry.fromFile(it) }
+    /**
+     * 直接按名称定位子项，不再 listFiles 整个目录。
+     *
+     * 名称必须是单段 basename：空串、`.`、`..`、含路径分隔符或非法字符一律拒绝，
+     * 保持旧 listFiles 匹配结果不可能越出当前目录的约束。
+     * 是否真实存在用该子项已加载的同一份元数据判断，不会额外 stat。
+     */
+    override fun findChild(name: String): ImageEntry? {
+        if (!isChildName(name)) return null
+        val child = FileImageEntry(File(file, name))
+        child.ensureMetadata()
+        // 旧实现只返回目录项中真实存在的那一项；这里直接复用刚取得的元数据判断。
+        return child.takeIf { it.metadataExists }
+    }
+
+    private fun isChildName(name: String): Boolean {
+        if (name.isEmpty() || name == "." || name == "..") return false
+        if (name.indexOf('\u0000') >= 0) return false
+        // 平台自身的单段判断：绝对路径、`a/b`、`a/` 都会得到不同的 name。
+        return File(name).name == name
+    }
 
     override fun createDirectory(name: String): ImageEntry =
         ImageEntry.fromFile(ImageDirectoryAccess.createFolder(file, name))

@@ -49,12 +49,18 @@ internal object ImageFolderStore {
     val defaultTgStickersPath: String get() = HostImagePaths.defaults(hostType).tgStickers
 
     internal val sourcePaths: ImageSourcePaths
-        get() = HostImagePaths.resolve(
-            hostType,
-            HookSettings.getString(pathKey, defaultPath),
-            HookSettings.getString(FUNBOX_PATH_KEY, defaultFunBoxPath),
-            HookSettings.getString(TG_STICKERS_PATH_KEY, defaultTgStickersPath),
+        get() = sourcePaths(hostType)
+
+    /** 一次解析宿主与默认值，避免每个路径配置项再各自解析一次宿主。 */
+    private fun sourcePaths(host: HostType): ImageSourcePaths {
+        val defaults = HostImagePaths.defaults(host)
+        return HostImagePaths.resolve(
+            host,
+            HookSettings.getString(host.imagePathKey, defaults.images),
+            HookSettings.getString(FUNBOX_PATH_KEY, defaults.funBox),
+            HookSettings.getString(TG_STICKERS_PATH_KEY, defaults.tgStickers),
         )
+    }
 
     val ROOT_PATH: String get() = sourcePaths.images
 
@@ -96,8 +102,10 @@ internal object ImageFolderStore {
      * 配置的图片根。文档来源必须是仍持有持久读授权的真实目录；
      * 真实文件来源保持原来的「不存在就创建」行为。
      */
-    fun root(): ImageEntry {
-        val source = ROOT_PATH
+    fun root(): ImageEntry = root(ROOT_PATH)
+
+    /** 用已经解析过的来源构建授权根，供一次扫描内复用，不再重复读取宿主配置。 */
+    private fun root(source: String): ImageEntry {
         if (ImageEntry.isDocumentSource(source)) {
             val entry = ImageEntry.from(source)
             // from() 已经校验持久读授权并查询过文档状态：不能再 exists()，否则每次取根都会
@@ -152,51 +160,71 @@ internal object ImageFolderStore {
      * 枚举分类快照，供面板/表情面板一次绑定首屏。
      *
      * 根只解析一次，且只枚举“分类发现/外部可读过滤”真正需要的目录：授权根自身与外部来源
-     * 及其分组。自有子分类只保留根枚举得到的元数据，不提前 children()，避免把每个分类的
-     * 全部文件压回首屏屏障；分类集合与顺序和旧的 folders() 完全一致。
+     * 及其分组。真实文件来源只列一次目录、按名字过滤后做一次类型检查，并且每个分组最多
+     * 探测首张可读图片，不为未选中的图片列表构造句柄或排序；SAF 来源复用一次 query 的
+     * 元数据。自有子分类只保留根枚举得到的元数据，不提前 children()，分类集合与顺序和
+     * 旧的 folders() 完全一致。
+     *
+     * [onInitialLocalImages] 只在本轮参与扫描的来源全是普通文件路径时生效：在任何包/分类
+     * 发现之前，按 [initialSelectionKey]（非空优先）或已保存的选择预读当前分类并回调，
+     * 让首屏先拿到图片。SAF 或混合来源完全走原有完整扫描，不改变授权与可读性语义；
+     * 预读结果同时记入本次 [FolderScan.imagesByFolder]，完整扫描之后照常给出全部分类。
      */
-    fun scanFolders(includeExternal: Boolean = false): FolderScan {
-        val root = root()
-        val rootChildren = root.children()
+    fun scanFolders(
+        includeExternal: Boolean = false,
+        initialSelectionKey: String? = null,
+        onInitialLocalImages: ((ImageEntry, List<ImageEntry>) -> Unit)? = null,
+    ): FolderScan {
+        // 来源配置只解析一次：ROOT_PATH / SCAN_ROOTS 每个 getter 都会重新读取宿主配置，
+        // 旧实现里外部过滤、根解析和日志各取一次，SAF 上会累计成可观的 prefs 开销。
+        val host = hostType
+        val sources = sourcePaths(host)
+        val rootSource = sources.images
+        val root = root(rootSource)
         val imagesByFolder = LinkedHashMap<String, List<ImageEntry>>()
-        val owned = mutableListOf<ImageEntry>()
         // 选中的目录本身也可能直接放图片（没有子分类）；必须作为不可删除的分类出现。
-        // 它和分类共用同一批 children：一次判断可读性，一次取图片列表。
-        if (rootChildren.any(::isReadableImage)) owned += root
-        imagesByFolder[root.key] = sortedImages(rootChildren)
-        rootChildren.filterTo(owned) {
-            it.isDirectory && it.name != HISTORY_DIR_NAME && !it.name.startsWith(".")
+        val localRoot = root.localFile
+        // 已知当前分类的预读必须早于任何包/分类发现，且只在全本地来源下进行：
+        // 这里读的正是完整扫描之后本来就会读的那一份，不绕过任何授权校验。
+        if (onInitialLocalImages != null && localRoot != null) {
+            val extraSources = if (includeExternal) {
+                sources.scanRoots.filter { it != rootSource }
+            } else {
+                emptyList()
+            }
+            if (extraSources.none { ImageEntry.isDocumentSource(it) }) {
+                prepareInitialLocalImages(
+                    initialSelectionKey,
+                    localRoot,
+                    extraSources,
+                    imagesByFolder,
+                    onInitialLocalImages,
+                )
+            }
+        }
+        val owned = mutableListOf<ImageEntry>()
+        if (localRoot != null) {
+            // 真实文件来源只列一次目录：隐藏项先按名字排除，分类只做一次类型检查，
+            // 图片仅在判断“根自身是不是扁平分类”时探测首张，不提前包装整个列表。
+            val local = scanLocalDirectory(localRoot)
+            if (local != null) {
+                if (local.hasReadableImage) owned += root
+                owned += local.folders
+            }
+        } else {
+            // SAF 路径的一次 query 已经带回全部子项元数据，图片列表不再二次读取。
+            val rootChildren = root.children()
+            if (rootChildren.any(::isReadableImage)) owned += root
+            imagesByFolder[root.key] = sortedImages(rootChildren)
+            rootChildren.filterTo(owned) {
+                it.isDirectory && it.name != HISTORY_DIR_NAME && !it.name.startsWith(".")
+            }
         }
         val extra = if (includeExternal) {
-            SCAN_ROOTS.asSequence()
-                .filter { it != ROOT_PATH }
+            sources.scanRoots.asSequence()
+                .filter { it != rootSource }
                 .mapNotNull { externalRoot(it) }
-                .flatMap { source ->
-                    val children = source.children()
-                    val result = mutableListOf<ImageEntry>()
-                    if (children.any(::isReadableImage)) {
-                        result += source
-                        imagesByFolder[source.key] = sortedImages(children)
-                    }
-                    // 外部目录里没有可读图片的分组不展示：系统可能放行列目录、却拒绝读文件，
-                    // 过滤掉这些分组，避免出现一排点进去全空、切换还卡顿的分类。
-                    // 这里枚举到的 children 同时就是该分组的图片列表，不再二次枚举。
-                    for (child in children) {
-                        if (
-                            !child.isDirectory ||
-                            child.name == HISTORY_DIR_NAME ||
-                            child.name.startsWith(".")
-                        ) {
-                            continue
-                        }
-                        val childEntries = child.children()
-                        if (childEntries.any(::isReadableImage)) {
-                            result += child
-                            imagesByFolder[child.key] = sortedImages(childEntries)
-                        }
-                    }
-                    result.asSequence()
-                }
+                .flatMap { source -> externalFolders(source, imagesByFolder).asSequence() }
                 .toList()
         } else {
             emptyList()
@@ -204,15 +232,65 @@ internal object ImageFolderStore {
         val real = (owned + extra)
             .distinctBy { it.key }
             .filter { !isHistoryFolder(it) }
-            .sortedWith(
-                compareByDescending<ImageEntry> { folderUsage(it) }
-                    .thenBy { displayName(it).lowercase() },
-            )
-        if (isWeChat) {
-            Log.info("微信目录扫描: root=$ROOT_PATH 自有分类=${owned.size} 外部分类=${extra.size}")
+        val history = historyFolder(root)
+        val labels = scanLabels(real, history, sources.funBox)
+        // usage 只取一次快照，count 在锁内读出；排序键在进入比较器之前算好，
+        // 比较器里不再访问 prefs、文件系统或 JSON。
+        val usageCounts = synchronized(usageLock) {
+            val store = loadUsageLocked(rootSource)
+            IntArray(real.size) { index -> store.folders[real[index].key]?.count ?: 0 }
         }
-        val folders = if (includeExternal) listOf(historyFolder(root)) + real else real
-        return FolderScan(root = root, folders = folders, imagesByFolder = imagesByFolder)
+        val sorted = real
+            .mapIndexed { index, folder ->
+                Triple(
+                    folder,
+                    usageCounts[index],
+                    labels.getValue(folder.key).lowercase(),
+                )
+            }
+            .sortedWith(
+                compareByDescending<Triple<ImageEntry, Int, String>> { it.second }
+                    .thenBy { it.third },
+            )
+            .map { it.first }
+        if (host == HostType.WECHAT) {
+            Log.info("微信目录扫描: root=$rootSource 自有分类=${owned.size} 外部分类=${extra.size}")
+        }
+        val folders = if (includeExternal) listOf(history) + sorted else sorted
+        return FolderScan(
+            root = root,
+            folders = folders,
+            imagesByFolder = imagesByFolder,
+            labels = labels,
+        )
+    }
+
+    /**
+     * 一次求出本次扫描的分类显示名。历史分类固定为「历史」；FunBox 包名只在本次扫描
+     * 确实包含 FunBox 子分类时解析一次，其余分类直接使用目录名。
+     */
+    private fun scanLabels(
+        folders: List<ImageEntry>,
+        history: ImageEntry,
+        funBoxSource: String,
+    ): Map<String, String> {
+        val labels = LinkedHashMap<String, String>(folders.size + 1)
+        labels[history.key] = "历史"
+        val funBox = funBoxEntry(funBoxSource)
+        val packNames = if (funBox != null && folders.any { it.parentKey == funBox.key }) {
+            funBoxPackNames(funBox)
+        } else {
+            emptyMap()
+        }
+        for (folder in folders) {
+            val label = if (funBox != null && folder.parentKey == funBox.key) {
+                packNames[folder.name]?.takeIf { it.isNotBlank() } ?: folder.name
+            } else {
+                folder.name
+            }
+            labels[folder.key] = label
+        }
+        return labels
     }
 
     /** 外部来源只在缺失时跳过；已配置的 URI 授权失效仍然明确抛出。 */
@@ -221,10 +299,113 @@ internal object ImageFolderStore {
         return entry.takeIf { it.isDirectory }
     }
 
+    /**
+     * 外部来源的分类发现。真实文件来源只探测每个分组的第一张可读图片，不把未选中分组的
+     * 全部图片包装成句柄、读取大小/时间或排序进快照；SAF 来源继续复用一次 query 的元数据。
+     */
+    private fun externalFolders(
+        source: ImageEntry,
+        imagesByFolder: MutableMap<String, List<ImageEntry>>,
+    ): List<ImageEntry> {
+        val local = source.localFile
+        if (local != null) {
+            val result = mutableListOf<ImageEntry>()
+            val direct = scanLocalDirectory(local) ?: return result
+            if (direct.hasReadableImage) result += source
+            for (folder in direct.folders) {
+                val folderLocal = folder.localFile ?: continue
+                if (hasReadableLocalImage(folderLocal)) result += folder
+            }
+            return result
+        }
+        val children = source.children()
+        val result = mutableListOf<ImageEntry>()
+        if (children.any(::isReadableImage)) {
+            result += source
+            imagesByFolder[source.key] = sortedImages(children)
+        }
+        // 外部目录里没有可读图片的分组不展示：系统可能放行列目录、却拒绝读文件，
+        // 过滤掉这些分组，避免出现一排点进去全空、切换还卡顿的分类。
+        // 这里枚举到的 children 同时就是该分组的图片列表，不再二次枚举。
+        for (child in children) {
+            if (
+                !child.isDirectory ||
+                child.name == HISTORY_DIR_NAME ||
+                child.name.startsWith(".")
+            ) {
+                continue
+            }
+            val childEntries = child.children()
+            if (childEntries.any(::isReadableImage)) {
+                result += child
+                imagesByFolder[child.key] = sortedImages(childEntries)
+            }
+        }
+        return result
+    }
+
+    /**
+     * 本地目录只调用一次 [File.listFiles]：先按名字排除隐藏项/历史目录，再对剩余候选做
+     * 一次类型检查收集直接分类；图片只在探测首张可读图片时构造一次句柄，找到即停止。
+     */
+    private fun scanLocalDirectory(directory: File): LocalDirectoryScan? {
+        val files = directory.listFiles() ?: return null
+        val folders = ArrayList<ImageEntry>(files.size)
+        var hasReadableImage = false
+        for (file in files) {
+            val name = file.name
+            if (name.startsWith(".") || name == HISTORY_DIR_NAME) continue
+            if (file.isDirectory) {
+                folders += ImageEntry.fromFile(file)
+                continue
+            }
+            if (hasReadableImage || !isImageName(name)) continue
+            if (isReadableLocalImage(file)) hasReadableImage = true
+        }
+        return LocalDirectoryScan(folders, hasReadableImage)
+    }
+
+    /** 分组只要有一张真实可读图片就展示；单张不可读时继续查下一张。 */
+    private fun hasReadableLocalImage(directory: File): Boolean {
+        val files = directory.listFiles() ?: return false
+        for (file in files) {
+            val name = file.name
+            if (name.startsWith(".") || name == HISTORY_DIR_NAME || !isImageName(name)) continue
+            if (isReadableLocalImage(file)) return true
+        }
+        return false
+    }
+
+    private fun isReadableLocalImage(file: File): Boolean {
+        if (!file.isFile) return false
+        return runCatching { file.inputStream().use { } }.isSuccess
+    }
+
+    private class LocalDirectoryScan(
+        val folders: List<ImageEntry>,
+        val hasReadableImage: Boolean,
+    )
+
     fun images(folder: ImageEntry): List<ImageEntry> {
         if (isHistoryFolder(folder)) return historyImages()
+        val local = folder.localFile
+        if (local != null) return localImages(local)
         if (!folder.isDirectory) return emptyList()
         return sortedImages(folder.children())
+    }
+
+    /** 本地列表先按名字排掉隐藏/非图片项，再只对候选图片构造句柄并排序。 */
+    private fun localImages(directory: File): List<ImageEntry> {
+        val files = directory.listFiles() ?: return emptyList()
+        val images = ArrayList<ImageEntry>(files.size)
+        for (file in files) {
+            if (!isImageName(file.name)) continue
+            val entry = ImageEntry.fromFile(file)
+            // 快照里的类型/时间来自一次元数据读取，不再逐项重复 stat。
+            if (entry.isFile) images += entry
+        }
+        if (images.size > 1) images.sortByDescending { it.modified }
+        return images
     }
 
     private fun sortedImages(children: List<ImageEntry>): List<ImageEntry> =
@@ -234,11 +415,31 @@ internal object ImageFolderStore {
 
     fun coverFile(folder: ImageEntry): ImageEntry? {
         if (isHistoryFolder(folder)) return historyImages().firstOrNull()
+        val local = folder.localFile
+        if (local != null) return localCover(local)
         if (!folder.isDirectory) return null
         return folder.children()
             .asSequence()
             .filter { it.isFile && isImageEntry(it) }
             .minByOrNull { it.modified }
+    }
+
+    /** 封面只取最早修改的一张，不排序整份图片列表。 */
+    private fun localCover(directory: File): ImageEntry? {
+        val files = directory.listFiles() ?: return null
+        var cover: ImageEntry? = null
+        var coverModified = Long.MAX_VALUE
+        for (file in files) {
+            if (!isImageName(file.name)) continue
+            val entry = ImageEntry.fromFile(file)
+            if (!entry.isFile) continue
+            val modified = entry.modified
+            if (cover == null || modified < coverModified) {
+                cover = entry
+                coverModified = modified
+            }
+        }
+        return cover
     }
 
     fun displayName(folder: ImageEntry): String {
@@ -289,6 +490,84 @@ internal object ImageFolderStore {
             ?.bufferedReader()
             ?.use { it.readText() }
             ?.trim()
+    }.getOrNull().orEmpty()
+
+    /**
+     * 在为分类发现枚举根目录之前，预读当前分类的真实图片并回调。
+     *
+     * 只有调用方确认本轮参与的来源全是普通文件路径后才会走到这里：因此选择只可能是
+     * 本轮配置根本身或它们的可见直接子目录，除此之外（文档 URI、隐藏项、历史虚拟分类、
+     * 越层/不存在的路径）一律放弃预读，不猜测默认分类。选择的绝对路径身份保持配置时的
+     * 写法，不做 canonical 化，避免别名被改写或符号链接被提前解析。
+     *
+     * 读到非空且至少一张真正可打开的普通图片时，才把列表放 [imagesByFolder] 并回调；
+     * 完整扫描随后照常发现全部分类、过滤可读性并排序，不会因为这次预读而缩小快照。
+     */
+    private fun prepareInitialLocalImages(
+        initialSelectionKey: String?,
+        root: File,
+        extraSources: List<String>,
+        imagesByFolder: MutableMap<String, List<ImageEntry>>,
+        onInitialLocalImages: (ImageEntry, List<ImageEntry>) -> Unit,
+    ) {
+        val roots = ArrayList<File>(extraSources.size + 1)
+        roots += root
+        for (source in extraSources) {
+            val local = runCatching { ImageEntry.from(source) }.getOrNull()?.localFile ?: return
+            roots += local
+        }
+        val selected = resolveInitialLocalFolder(initialSelectionKey, roots) ?: return
+        val directory = selected.localFile ?: return
+        val images = localImages(directory)
+        if (images.isEmpty()) return
+        if (images.none { image -> image.localFile?.let(::isReadableLocalImage) == true }) return
+        imagesByFolder[selected.key] = images
+        // 回调只是提前绘制：即使消费方抛错，也不能毁掉随后保证全部分类的完整扫描。
+        runCatching { onInitialLocalImages(selected, images) }
+            .onFailure { Log.error("首屏当前分类预读回调失败: ${selected.key}", it) }
+    }
+
+    /**
+     * 选择本轮可预读的本地分类。
+     *
+     * 优先调用方明确给出的 [initialSelectionKey]（非空），否则用保存的分类 key；旧版
+     * `.last_folder` 标记直接按单个文件读取，不枚举根目录。选择无效时返回 null：
+     * 空、文档 URI、历史分类、隐藏项、不是目录、不在本轮配置根之下都不预读。
+     */
+    private fun resolveInitialLocalFolder(
+        initialSelectionKey: String?,
+        roots: List<File>,
+    ): ImageEntry? {
+        val preferred = initialSelectionKey?.takeIf { it.isNotBlank() }
+        val saved = preferred
+            ?: HookSettings.getString(LAST_FOLDER_KEY, "")
+                .ifBlank { readLocalLastFolderMarker(roots.first()) }
+        if (saved.isBlank() || ImageEntry.isDocumentSource(saved) || isHistoryKey(saved)) return null
+        val candidate = File(saved)
+        if (!candidate.isAbsolute) return null
+        val name = candidate.name
+        for (root in roots) {
+            val rootPath = root.absolutePath
+            if (candidate.path == rootPath) {
+                // 配置根本身允许是隐藏目录（默认根就是 .qqzygisk），只对子目录做隐藏过滤。
+                val entry = ImageEntry.fromFile(root)
+                if (entry.isDirectory) return entry
+                continue
+            }
+            // 只接受配置根的直接子目录；更深的路径可能落在其他来源里，不能凭 key 前缀信任。
+            if (candidate.parent != rootPath) continue
+            if (name.isEmpty() || name.startsWith(".") || name == HISTORY_DIR_NAME) continue
+            val entry = ImageEntry.fromFile(candidate)
+            if (entry.isDirectory) return entry
+        }
+        return null
+    }
+
+    /** 旧版标记在本地根里按单个文件名直接读取，绝不调用 listFiles 枚举目录。 */
+    private fun readLocalLastFolderMarker(root: File): String = runCatching {
+        val marker = File(root, LAST_FOLDER_FILE)
+        if (!marker.isFile) return@runCatching null
+        marker.inputStream().bufferedReader().use { it.readText() }.trim()
     }.getOrNull().orEmpty()
 
     /** 真的能打开一次流才算可读：跨应用目录可能列得出文件却拒绝读取。 */
@@ -757,9 +1036,9 @@ internal object ImageFolderStore {
         }
     }
 
-    private fun metadata(): ImagePanelMetadata {
+    private fun metadata(source: String = ROOT_PATH): ImagePanelMetadata {
         val context = checkNotNull(AppParasitics.appContext) { "宿主 Application 尚未初始化" }
-        val raw = ROOT_PATH
+        val raw = source
         val document = ImageEntry.isDocumentSource(raw)
         // 真实文件来源必须沿用旧实现 `File(ROOT_PATH).absolutePath` 的摘要，
         // 否则旧 .usage.json 的使用记录文件名会变化、历史直接丢失。
@@ -768,11 +1047,10 @@ internal object ImageFolderStore {
         return ImagePanelMetadata(context.filesDir, identity, legacy)
     }
 
-    private fun loadUsageLocked(): UsageStore {
-        val currentRoot = ROOT_PATH
-        usageCache?.takeIf { usageCacheRoot == currentRoot }?.let { return it }
+    private fun loadUsageLocked(source: String = ROOT_PATH): UsageStore {
+        usageCache?.takeIf { usageCacheRoot == source }?.let { return it }
         val parsed = runCatching {
-            val raw = metadata().readUsage().orEmpty()
+            val raw = metadata(source).readUsage().orEmpty()
             if (raw.isBlank()) return@runCatching UsageStore()
             val json = JSONObject(raw)
             UsageStore(
@@ -780,19 +1058,20 @@ internal object ImageFolderStore {
                 folders = readUsageMap(json.optJSONObject("folders")),
             )
         }.getOrDefault(UsageStore())
-        usageCacheRoot = currentRoot
+        usageCacheRoot = source
         usageCache = parsed
         return parsed
     }
 
     private fun saveUsageLocked(store: UsageStore) {
-        usageCacheRoot = ROOT_PATH
+        val rootSource = ROOT_PATH
+        usageCacheRoot = rootSource
         usageCache = store
         runCatching {
             val json = JSONObject()
                 .put("files", writeUsageMap(store.files))
                 .put("folders", writeUsageMap(store.folders))
-            metadata().writeUsage(json.toString())
+            metadata(rootSource).writeUsage(json.toString())
         }.onFailure { Log.error("保存表情使用记录失败，保留当前进程内的记录", it) }
     }
 
@@ -907,7 +1186,7 @@ internal object ImageFolderStore {
         return null
     }
 
-    private fun isImageEntry(entry: ImageEntry): Boolean = isImageName(entry.name)
+    internal fun isImageEntry(entry: ImageEntry): Boolean = isImageName(entry.name)
 
     private fun isImageName(name: String): Boolean {
         if (name.startsWith(".") || name.startsWith("__cover__.") || name.endsWith(".txt.jpg")) {
@@ -960,15 +1239,23 @@ internal object ImageFolderStore {
 /**
  * [ImageFolderStore.scanFolders] 一次加载得到的分类快照。
  *
- * [imagesByFolder] 只包含本次扫描真正枚举过的目录（授权根、外部可读分组，以及调用方用
- * [withImagesFor] 刚枚举过的分类），值遵循 [ImageFolderStore.images] 的筛选与排序；
- * 消费者未命中时应调用 [ImageFolderStore.images] 重新读取。
+ * [imagesByFolder] 只包含本次扫描真正枚举过且已持有图片列表的目录（SAF 授权根、SAF 外部
+ * 可读分组、扫描开始时按已知选择预读的本地分类，以及调用方用 [withImagesFor] 刚枚举过的
+ * 分类），值遵循 [ImageFolderStore.images] 的筛选与排序；真实文件来源的分类不提前枚举，
+ * 因此这里可以缺项。
+ * 消费者未命中时应调用 [ImageFolderStore.images] 重新读取，绝不能把缺项当成空列表。
+ * [labels] 是本次扫描一次求出的分类显示名（含历史分类），消费方直接取用。
  * 这只是单次加载快照：不能用来绕过后续的读取/解码/删除授权校验。
  */
 internal data class FolderScan(
     val root: ImageEntry,
     val folders: List<ImageEntry>,
     val imagesByFolder: Map<String, List<ImageEntry>>,
+    /**
+     * 本次扫描一次算好的分类显示名，key 为分类 key，历史分类也在其中。
+     * 消费方直接取用，不必再逐个调用 [ImageFolderStore.displayName]。
+     */
+    val labels: Map<String, String>,
 ) {
     /**
      * 把刚刚真正枚举过的分类图片补进快照，供首屏直接绑定。

@@ -347,7 +347,7 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
     private inner class Panel(
         private val entry: ImageEntry,
         private val panelId: String,
-        initialImages: List<ImageEntry>,
+        initialImages: List<ImageEntry>?,
         scanGeneration: Int,
     ) : ExtraEmoticonPanel() {
         private val stateLock = Any()
@@ -355,10 +355,10 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
         private var iconResolved = false
         private var iconGeneration = -1
 
-        /** 分类扫描时已枚举的图片；首次打开面板直接复用，避免再列一次目录。 */
+        /** null 表示分类发现未携带图片，首次打开时再读取；空列表不是这个状态。 */
         private var pendingImages: List<ImageEntry>? = initialImages
         private var pendingGeneration: Int = scanGeneration
-        private var knownImages: List<ImageEntry> = initialImages
+        private var knownImages: List<ImageEntry> = initialImages.orEmpty()
 
         private val content = SnapshotLoader(
             groupId = panelId,
@@ -473,18 +473,25 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
         }
 
         /**
-         * 一次枚举同时决定图标：先找 `__cover__.` 覆盖文件，否则使用分类扫描已得到的
-         * 图片列表（等价于旧 coverFile/images 的最低 modified 项），不再重复列目录。
+         * 一次枚举同时决定图标：先找 `__cover__.`，否则从同一份实际子项里选最早的图片。
+         * 本地目录不再由分类发现预读整包，不能继续依赖可能已经删除的旧封面候选。
          */
         private fun resolveIconPath(): String? {
-            val namedCover = try {
-                entry.children().firstOrNull { it.isFile && it.name.startsWith("__cover__.") }
+            val children = try {
+                entry.children()
             } catch (error: Throwable) {
                 if (error is ImageAccessException) throw error
                 Log.warn("枚举分类封面失败: ${entry.key}", error)
                 null
             }
-            val fallback = synchronized(stateLock) { knownImages }.minByOrNull { it.modified }
+            val namedCover = children?.firstOrNull { it.isFile && it.name.startsWith("__cover__.") }
+            val fallback = if (children != null) {
+                children.asSequence()
+                    .filter { it.isFile && ImageFolderStore.isImageEntry(it) }
+                    .minByOrNull { it.modified }
+            } else {
+                synchronized(stateLock) { knownImages }.minByOrNull { it.modified }
+            }
             val target = namedCover ?: fallback ?: return null
             return nativePathOf(target) { error ->
                 if (error is ImageAccessException) throw error
@@ -648,21 +655,14 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
             if (!seen.add(key)) continue
             val existing = panelsMap[key]
             if (existing != null) {
-                // 尚未打开的首次加载快照跟随本次扫描换代；已加载的面板不受影响。
-                scan.imagesByFolder[key]?.let { existing.updatePending(it, generation) }
+                val preloaded = scan.imagesByFolder[key]
+                if (preloaded != null) existing.updatePending(preloaded, generation)
                 panels.add(existing to folder)
                 continue
             }
-            // 扫描未覆盖的目录（如历史占位、扫描后被删掉的目录）才回退到实时枚举。
-            val images = scan.imagesByFolder[key]?.let { Result.success(it) }
-                ?: runCatching { ImageFolderStore.images(folder) }
-            if (images.isFailure) {
-                images.exceptionOrNull()?.let { error -> reportAccessError(error) }
-                continue
-            }
-            val available = images.getOrDefault(emptyList())
-            if (available.isEmpty()) continue
-            val panel = Panel(folder, folder.name, available, generation)
+            val preloaded = scan.imagesByFolder[key]
+            if (preloaded != null && preloaded.isEmpty()) continue
+            val panel = Panel(folder, folder.name, preloaded, generation)
             panelsMap[key] = panel
             panels.add(panel to folder)
         }

@@ -9,6 +9,7 @@ import android.widget.RelativeLayout
 import android.widget.Toast
 import com.highcapable.kavaref.KavaRef.Companion.asResolver
 import com.highcapable.kavaref.KavaRef.Companion.resolve
+import com.qm.qqzygisk.R
 import com.qm.qqzygisk.hook.app.base.BaseHooker
 import com.qm.qqzygisk.hook.app.chat.ImageFolderStore
 import com.qm.qqzygisk.hook.app.data.HostData.toAppClass
@@ -48,13 +49,24 @@ object EmoticonPanelHooker : BaseHooker() {
     private var lastController: WeakReference<Any>? = null
     private var lastPanelData: WeakReference<MutableList<Any>>? = null
     private var lastAdapter: WeakReference<Any>? = null
+    private val tabItemIcons = java.util.WeakHashMap<Any, String?>()
+    private val tabItemConstructor by lazy {
+        "com.tencent.mobileqq.emoticonview.EmoticonTabAdapter\$EmoticonTabItem"
+            .toAppClass().resolve().firstConstructor { parameterCount = 0 }
+    }
     private val pageLists = CopyOnWriteArrayList<RetainedPage>()
     private const val MAX_RETAINED_PAGES = 32
+    private var historyTabIconState: Drawable.ConstantState? = null
 
     private data class RetainedPage(
         val providerId: String,
         val panelId: String,
-        val list: WeakReference<MutableList<Any>>,
+        // 宿主复制后不再持有原列表；由弱 adapter 的生命周期约束这份对齐状态。
+        val list: MutableList<Any>,
+        val position: Int,
+        val info: WeakReference<Any>,
+        val pager: WeakReference<Any>,
+        val adapter: WeakReference<Any>,
     )
 
     data class QZEpId (var providerId: String = "",var panelId: String)
@@ -80,6 +92,24 @@ object EmoticonPanelHooker : BaseHooker() {
                 }
             }
         }
+    }
+
+    private fun getHistoryTabDrawable(method: MethodCall) {
+        val item = method.args[0] ?: return
+        val id = item.get<String>("epId")?.let(::parseQZEpId) ?: return
+        if (id.panelId != ImageFolderStore.HISTORY_DIR_NAME) return
+        if (providers.none { it is LocalDocumentEmoticonProvider && it.uniqueId() == id.providerId }) return
+        val context = AppParasitics.appContext ?: return
+        val state = historyTabIconState ?: run {
+            AppParasitics.ensureModuleAppResources(context.resources)
+            context.getDrawable(R.drawable.ic_history)?.constantState
+                ?.also { historyTabIconState = it }
+        } ?: return
+        val drawable = state.newDrawable(context.resources).mutate()
+        val night = context.resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK == android.content.res.Configuration.UI_MODE_NIGHT_YES
+        drawable.setTint(if (night) android.graphics.Color.WHITE else android.graphics.Color.DKGRAY)
+        method.result = drawable
     }
 
     private fun getPanelDataList(method: MethodCall) {
@@ -131,8 +161,6 @@ object EmoticonPanelHooker : BaseHooker() {
      * 宿主内置/非模块面板原样保留。分类列表尚未发布（加载中或首次失败）时完全不动。
      */
     private fun reconcileExtraPanels(result: MutableList<Any>) {
-        if (providers.any { !providerSnapshotReady(it) }) return
-
         val desiredPanels = mutableListOf<Pair<String, ExtraEmoticonPanel>>()
         val desiredSet = linkedSetOf<String>()
         for (provider in providers) {
@@ -141,6 +169,9 @@ object EmoticonPanelHooker : BaseHooker() {
                 if (desiredSet.add(epId)) desiredPanels.add(epId to panel)
             }
         }
+        // extraEmoticonList() 同时调度后台扫描，必须先触达再检查发布状态。
+        // 启动预热可能因设置/Context 尚未就绪而跳过，不能用 not ready 挡住首次加载。
+        if (providers.any { !providerSnapshotReady(it) }) return
 
         val iterator = result.iterator()
         while (iterator.hasNext()) {
@@ -205,6 +236,55 @@ object EmoticonPanelHooker : BaseHooker() {
                 }
                 .invoke()
         }.onFailure { Log.warn("刷新表情面板视图失败", it) }
+        refreshTabViews(controller)
+    }
+
+    /** tab 的 mData 是页面列表的独立副本；后台发布后必须同步，不能只刷新 pager。 */
+    private fun refreshTabViews(controller: Any?) {
+        if (controller == null || providers.any { !providerSnapshotReady(it) }) return
+        val panelData = lastPanelData?.get() ?: return
+        runCatching {
+            val adapter = controller.asResolver()
+                .firstMethod { name = "getEmoticonTabAdapter" }.invoke() ?: return
+            val current = adapter.get<List<Any>>("mData") ?: return
+            val existing = HashMap<String, Any>()
+            val next = ArrayList<Any>(panelData.size)
+            for (item in current) {
+                val epId = item.get<String>("epId")
+                if (epId?.startsWith("qz:") == true) existing[epId] = item
+                else next.add(item)
+            }
+            val panels = HashMap<String, ExtraEmoticonPanel>()
+            for (provider in providers) {
+                for (panel in provider.extraEmoticonList()) {
+                    panels["qz:${provider.uniqueId()}:${panel.uniqueId()}"] = panel
+                }
+            }
+            for (info in panelData) {
+                val epId = epIdOf(info) ?: continue
+                val panel = panels[epId] ?: continue
+                val icon = panel.emoticonPanelIconURL()
+                val old = existing[epId]
+                val item = if (old != null && tabItemIcons.containsKey(old) && tabItemIcons[old] == icon) {
+                    old
+                } else {
+                    tabItemConstructor.create().also {
+                        it.set("type", info.get<Int>("type")!!)
+                        it.set("epId", epId)
+                        it.set("description", if (panel.uniqueId() == ImageFolderStore.HISTORY_DIR_NAME) "历史" else panel.uniqueId())
+                        // 新图标就绪时重建模块 tab，清除宿主首次空 URL 的 completed 状态。
+                        tabItemIcons[it] = icon
+                    }
+                }
+                next.add(item)
+            }
+            if (current.size == next.size && current.indices.all { current[it] === next[it] }) return
+            adapter.asResolver().firstMethod { name = "updateData" }.invoke(next)
+            adapter.asResolver().firstMethod {
+                name = "notifyDataSetChanged"
+                superclass()
+            }.invoke()
+        }.onFailure { Log.warn("同步表情 tab 数据失败", it) }
     }
 
     /** 后台快照就绪后到主线程重建数据源并刷新；加载中的空列表只是瞬时状态。 */
@@ -222,13 +302,31 @@ object EmoticonPanelHooker : BaseHooker() {
         }
     }
 
-    /** 首次打开时页面快照可能还在加载，这里把后来就绪的图片补进宿主已有的页面列表。 */
+    /** 宿主网格复制了返回列表，后台快照必须重新走宿主的数据完成回调。 */
     private fun refreshPageEmoticons() {
-        pageLists.removeAll { it.list.get() == null }
+        pageLists.removeAll { it.adapter.get() == null || it.pager.get() == null }
+        val controller = lastController?.get() ?: return
+        val root = controller.asResolver().firstMethod { name = "getViewPager" }.invoke() as? android.view.View ?: return
+        fun findGrid(view: android.view.View, adapter: Any): android.widget.ListView? {
+            if (view is android.widget.ListView && view.adapter === adapter) return view
+            if (view is android.view.ViewGroup) {
+                for (i in 0 until view.childCount) {
+                    findGrid(view.getChildAt(i), adapter)?.let { return it }
+                }
+            }
+            return null
+        }
         for (page in pageLists) {
-            val list = page.list.get() ?: continue
-            runCatching { reconcileEmoticons(page.providerId, page.panelId, list) }
-                .onFailure { Log.warn("刷新表情页面失败", it) }
+            val list = page.list
+            runCatching {
+                if (!reconcileEmoticons(page.providerId, page.panelId, list)) return@runCatching
+                val pager = page.pager.get() ?: return@runCatching
+                val adapter = page.adapter.get() ?: return@runCatching
+                val info = page.info.get() ?: return@runCatching
+                val grid = findGrid(root, adapter) ?: return@runCatching
+                pager.asResolver().firstMethod { name = "onGetPanelDataResult" }
+                    .invoke(page.position, info, adapter, grid, list.toList())
+            }.onFailure { Log.warn("刷新表情图片网格失败", it) }
         }
     }
 
@@ -237,17 +335,18 @@ object EmoticonPanelHooker : BaseHooker() {
      * 已删除的图片移除，内容更新（新的实质化路径）替换旧对象，非模块条目原样保留。
      * 面板快照尚未成功发布时保留现有列表，加载/错误不会被当成删除。
      */
-    private fun reconcileEmoticons(providerId: String, panelId: String, list: MutableList<Any>) {
-        val provider = providers.find { it.uniqueId() == providerId } ?: return
+    private fun reconcileEmoticons(providerId: String, panelId: String, list: MutableList<Any>): Boolean {
+        val provider = providers.find { it.uniqueId() == providerId } ?: return false
         val panel = provider.extraEmoticonList().find { it.uniqueId() == panelId }
         if (panel == null) {
+            val oldSize = list.size
             if (providerSnapshotReady(provider)) removeOwnedEmoticons(list, panelId)
-            return
+            return list.size != oldSize
         }
         val prefix = "$panelId:"
         // 先触达 emoticons() 以调度首次异步加载；加载中不修改宿主列表。
         val desired = panel.emoticons().map { it.QQEmoticonObject() }
-        if (!panel.isSnapshotReady()) return
+        if (!panel.isSnapshotReady()) return false
         val desiredSignature = desired.map { "${actionDataOf(it).orEmpty()}|${pathOf(it).orEmpty()}" }
 
         val ownedIndexes = mutableListOf<Int>()
@@ -258,12 +357,13 @@ object EmoticonPanelHooker : BaseHooker() {
             ownedIndexes.add(index)
             currentSignature.add("$action|${pathOf(item).orEmpty()}")
         }
-        if (currentSignature == desiredSignature) return
+        if (currentSignature == desiredSignature) return false
 
         for (index in ownedIndexes.asReversed()) {
             list.removeAt(index)
         }
         list.addAll(desired)
+        return true
     }
 
     private fun removeOwnedEmoticons(list: MutableList<Any>, panelId: String) {
@@ -283,10 +383,12 @@ object EmoticonPanelHooker : BaseHooker() {
         val epId = pkg.get<String>("epId") ?: return
         val id = parseQZEpId(epId)
         if(id != null) {
-            pageLists.removeAll { it.list.get() == null }
-            if (pageLists.none { it.list.get() === list }) {
-                pageLists.add(RetainedPage(id.providerId, id.panelId, WeakReference(list)))
-            }
+            pageLists.removeAll { it.adapter.get() == null || it.adapter.get() === method.args[1] }
+            pageLists.add(RetainedPage(
+                id.providerId, id.panelId, list,
+                method.args[0] as Int, WeakReference(emotionPanelInfo),
+                WeakReference(method.instance), WeakReference(method.args[1]!!),
+            ))
             while (pageLists.size > MAX_RETAINED_PAGES) {
                 pageLists.removeAt(0)
             }
@@ -368,12 +470,22 @@ object EmoticonPanelHooker : BaseHooker() {
                 }
             }
 
+
         EmoticonTabAdapter
             .resolve()
             .firstMethod { name = "generateTabUrl" }
             .hook {
                 before {
                     if (enabled) generateTabUrl(this)
+                }
+            }
+
+        EmoticonTabAdapter
+            .resolve()
+            .firstMethod { name = "getTabDrawable" }
+            .hook {
+                before {
+                    if (enabled) getHistoryTabDrawable(this)
                 }
             }
 
