@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.text.InputType
@@ -29,9 +30,9 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.PopupMenu
 import android.widget.ProgressBar
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
@@ -74,9 +75,19 @@ class SaveImagePanel private constructor(
     private val selected = arrayOfNulls<ImageEntry>(1)
     private lateinit var titleView: TextView
     private lateinit var folderRow: LinearLayout
+    /** 浏览模式的分类侧栏：只创建/绑定可见分类，避免一次建满 20+ 张卡片和封面任务。 */
+    private var folderAdapter: FolderAdapter? = null
+    private var folderListMessage: TextView? = null
+    /** 分类栏数据版本：只在分类/选中/标签/可删性变化时让可见卡片重建，滚动时复用。 */
+    private var folderDatasetVersion = 0
 
     /** 上次扫描到的分类列表，切换分类时复用，不重复扫盘。 */
     private var loadedFolders: List<ImageEntry> = emptyList()
+    /**
+     * 本次目录快照：分类元数据、可删除性、已枚举分类的封面，以及首屏唯一一次图片复用。
+     * 面板存续期间切回分类仍走 ImageFolderStore.images() 重新枚举，不把快照当目录缓存。
+     */
+    private var currentScan: FolderScan? = null
     /** 分类显示名与可删除能力在后台一次算好，主线程不再访问 provider。 */
     private var folderLabels: Map<String, String> = emptyMap()
     private var deletableFolders: Set<String> = emptySet()
@@ -103,6 +114,10 @@ class SaveImagePanel private constructor(
     private val folderCoverExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "QQZygisk-FolderCover").apply { isDaemon = true }
     }
+    /** 首图贴出前挂起的可见分类封面请求；只在主线程读写。 */
+    private val pendingFolderCovers = mutableListOf<() -> Unit>()
+    @Volatile
+    private var folderCoverGateOpen = false
     /** 目录枚举、文档复制、保存/删除等磁盘与 provider 访问统一走这里，绝不在主线程做。 */
     private val ioExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "QQZygisk-ImageIO").apply { isDaemon = true }
@@ -137,6 +152,7 @@ class SaveImagePanel private constructor(
             folderCoverExecutor.shutdownNow()
             ioExecutor.shutdownNow()
             thumbnailRequests.clear()
+            pendingFolderCovers.clear()
             synchronized(thumbnailCache) { thumbnailCache.evictAll() }
             synchronized(animatedThumbnails) { animatedThumbnails.evictAll() }
             previewDialog?.dismiss()
@@ -294,17 +310,37 @@ class SaveImagePanel private constructor(
             val split = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
+            val list = ListView(context).apply {
+                isVerticalScrollBarEnabled = false
+                clipToPadding = false
+                divider = ColorDrawable(Color.TRANSPARENT)
+                dividerHeight = context.dp(8)
+                setPadding(0, 0, 0, 0)
+                adapter = FolderAdapter().also { folderAdapter = it }
+            }
+            val listMessage = messageView("").apply {
+                visibility = View.GONE
+                setPadding(context.dp(4), context.dp(12), context.dp(4), context.dp(12))
+            }
+            folderListMessage = listMessage
+            val folderColumn = FrameLayout(context)
+            folderColumn.addView(
+                list,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            folderColumn.addView(
+                listMessage,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP,
+                ),
+            )
             split.addView(
-                ScrollView(context).apply {
-                    isVerticalScrollBarEnabled = false
-                    addView(
-                        folderRow,
-                        ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ),
-                    )
-                },
+                folderColumn,
                 LinearLayout.LayoutParams(
                     context.dp(FOLDER_COLUMN_WIDTH),
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -392,23 +428,39 @@ class SaveImagePanel private constructor(
     private fun bindFolders() {
         val generation = ++folderGeneration
         val includeExternal = browseOnly
+        val preferredKey = selected[0]?.key
         val submit = runCatching {
             ioExecutor.execute {
                 val snapshot = runCatching {
-                    val folders = ImageFolderStore.folders(includeExternal = includeExternal)
+                    // 分类与目标分类的图片在同一次后台任务里准备好，首屏不再排队第二次扫描。
+                    val scan = ImageFolderStore.scanFolders(includeExternal = includeExternal)
+                    val folders = scan.folders
+                    val lastKey = runCatching {
+                        ImageFolderStore.lastFolderFrom(folders, scan.root)
+                    }.getOrNull()?.key
+                    // 与 onFoldersLoaded 的选中规则完全一致：刷新时保留当前分类。
+                    val target = folders.firstOrNull { it.key == preferredKey }
+                        ?: folders.firstOrNull { it.key == lastKey }
+                        ?: folders.firstOrNull { !ImageFolderStore.isHistoryFolder(it) }
+                        ?: folders.firstOrNull()
+                    // 只补目标分类；其余自有分类保持根枚举元数据，不提前扫内容。
+                    val readyScan = target?.let { folder ->
+                        runCatching { scan.withImagesFor(folder) }
+                            .onFailure {
+                                Log.error("首屏分类图片读取失败: ${folder.key}", it)
+                            }
+                            .getOrDefault(scan)
+                    } ?: scan
                     FolderSnapshot(
-                        folders = folders,
+                        scan = readyScan,
                         labels = folders.associate { folder ->
                             folder.key to runCatching { ImageFolderStore.displayName(folder) }
                                 .getOrDefault(folder.name)
                         },
-                        deletable = folders.filter { folder ->
-                            runCatching { ImageFolderStore.canDelete(folder) }.getOrDefault(false)
-                        }.map { it.key }.toSet(),
-                        lastKey = runCatching { ImageFolderStore.lastFolderFrom(folders) }
-                            .getOrNull()?.key,
-                        rootWritable = runCatching { ImageFolderStore.root().canWrite }
-                            .getOrDefault(false),
+                        // 可删除性直接来自本次扫描的根与分类父子关系，不再为每个分类解析授权根。
+                        deletable = folders.filter(scan::canDelete).map { it.key }.toSet(),
+                        lastKey = lastKey,
+                        rootWritable = scan.root.canWrite,
                     )
                 }
                 postToPanel {
@@ -427,16 +479,16 @@ class SaveImagePanel private constructor(
     }
 
     private fun onFoldersLoaded(snapshot: FolderSnapshot) {
-        val folders = snapshot.folders
+        val folders = snapshot.scan.folders
         loadedFolders = folders
+        currentScan = snapshot.scan
         folderLabels = snapshot.labels
         deletableFolders = snapshot.deletable
         rootWritable = snapshot.rootWritable
         if (folders.isEmpty()) {
             selected[0] = null
             if (browseOnly) titleView.text = "图片面板"
-            folderRow.removeAllViews()
-            folderRow.addView(messageView("还没有文件夹"))
+            showFolderMessage("还没有文件夹")
             refreshFolderActions()
             bindImages(null)
             return
@@ -446,21 +498,23 @@ class SaveImagePanel private constructor(
                 ?: folders.firstOrNull { !ImageFolderStore.isHistoryFolder(it) }
                 ?: folders.firstOrNull()
         }
+        // 首屏只复用一次本次扫描刚取到的目标分类图片；此后切回分类一律重新枚举。
+        val initial = selected[0]?.let { currentScan?.imagesByFolder?.get(it.key) }
+        bindImages(selected[0], initialImages = initial)
         renderFolderCards()
-        bindImages(selected[0])
     }
 
     private fun onFoldersFailed(error: Throwable) {
         Log.error("读取图片目录失败", error)
         loadedFolders = emptyList()
+        currentScan = null
         folderLabels = emptyMap()
         deletableFolders = emptySet()
         rootWritable = false
         selected[0] = null
         if (browseOnly) titleView.text = "图片面板"
         val message = panelErrorMessage(error)
-        folderRow.removeAllViews()
-        folderRow.addView(messageView(message))
+        showFolderMessage(message)
         refreshFolderActions()
         bindImages(null, message)
     }
@@ -520,16 +574,70 @@ class SaveImagePanel private constructor(
         }
     }
 
-    /** 只重建分类栏，不重新遍历文件系统（切换分类时用，避免整盘重扫导致卡顿）。 */
-    private fun renderFolderCards() {
-        folderRow.removeAllViews()
-        if (browseOnly) {
-            titleView.text = selected[0]?.let(::folderLabel) ?: "图片面板"
+    /** 浏览模式侧栏：只为可见位置创建卡片，滚动时按数据版本复用。 */
+    private inner class FolderAdapter : BaseAdapter() {
+        var folders: List<ImageEntry> = emptyList()
+
+        override fun getCount(): Int = folders.size
+
+        override fun getItem(position: Int): ImageEntry = folders[position]
+
+        override fun getItemId(position: Int): Long = folders[position].key.hashCode().toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val folder = getItem(position)
+            val checked = folder.key == selected[0]?.key
+            val stamp = "${folderDatasetVersion}|${folder.key}|${folderLabel(folder)}|$checked|" +
+                (folder.key in deletableFolders)
+            val view = (convertView as? LinearLayout)?.takeIf { it.tag == stamp }
+                ?: folderCard(folder).apply { tag = stamp }
+            view.layoutParams = AbsListView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            return view
         }
+    }
+
+    /**
+     * 只重建分类栏，不重新遍历文件系统（切换分类时用，避免整盘重扫导致卡顿）。
+     * 浏览模式由 ListView 按可见位置懒绑定；普通保存模式仍是原有的横向行。
+     */
+    private fun renderFolderCards() {
+        if (browseOnly) {
+            folderDatasetVersion++
+            folderAdapter?.let { adapter ->
+                adapter.folders = loadedFolders
+                adapter.notifyDataSetChanged()
+            }
+            folderListMessage?.visibility = View.GONE
+            titleView.text = selected[0]?.let(::folderLabel) ?: "图片面板"
+            refreshFolderActions()
+            return
+        }
+        folderRow.removeAllViews()
         loadedFolders.forEach { folder ->
             folderRow.addView(folderCard(folder))
         }
         refreshFolderActions()
+    }
+
+    /** 空列表/目录错误时在分类栏内提示；浏览模式同时清空懒加载列表，避免残留旧卡片。 */
+    private fun showFolderMessage(text: String?) {
+        if (browseOnly) {
+            folderDatasetVersion++
+            folderAdapter?.let { adapter ->
+                adapter.folders = emptyList()
+                adapter.notifyDataSetChanged()
+            }
+            folderListMessage?.let { message ->
+                message.text = text.orEmpty()
+                message.visibility = if (text == null) View.GONE else View.VISIBLE
+            }
+            return
+        }
+        folderRow.removeAllViews()
+        if (text != null) folderRow.addView(messageView(text))
     }
 
     private fun folderCard(folder: ImageEntry): View {
@@ -609,7 +717,16 @@ class SaveImagePanel private constructor(
         }
     }
 
-    private fun bindImages(folder: ImageEntry?, errorText: String? = null) {
+    /**
+     * [initialImages] 只给扫描完成后的首次绑定用：直接复用本次快照里刚取到的图片，
+     * 避免“刚扫完又排队扫一遍”。普通切换分类必须传 null，走 [ImageFolderStore.images]
+     * 重新枚举，保证面板存续期间切回分类能看到外部新增的图片。
+     */
+    private fun bindImages(
+        folder: ImageEntry?,
+        errorText: String? = null,
+        initialImages: List<ImageEntry>? = null,
+    ) {
         val grid = imageGrid ?: return
         val hint = emptyHint ?: return
         val generation = ++imageGeneration
@@ -617,6 +734,10 @@ class SaveImagePanel private constructor(
         if (folder == null) {
             hint.text = errorText ?: "还没有文件夹"
             hint.visibility = View.VISIBLE
+            return
+        }
+        if (initialImages != null) {
+            showImages(grid, hint, initialImages, generation)
             return
         }
         hint.text = "正在加载…"
@@ -652,7 +773,11 @@ class SaveImagePanel private constructor(
     ) {
         hint.text = "这个文件夹还没有图片"
         hint.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
-        if (files.isEmpty()) return
+        if (files.isEmpty()) {
+            // 没有可等首图：分类封面可以立即补上。
+            openFolderCoverGate()
+            return
+        }
         val fill = fill@{
             if (closed || generation != imageGeneration) return@fill
             val gap = context.dp(IMAGE_GAP)
@@ -724,11 +849,13 @@ class SaveImagePanel private constructor(
                 image.setImageBitmap(it)
                 AnimatedImageLoader.trace("cache-bitmap-applied", image)
             }
+            openFolderCoverGate()
             return
         }
         synchronized(animatedThumbnails) { animatedThumbnails.get(key) }?.let { cached ->
             AnimatedImageLoader.trace("cache-hit-animated generation=$generation", image, cached)
             AnimatedImageLoader.bind(image, cached)
+            openFolderCoverGate()
             return
         }
         if (!sameKey) {
@@ -738,6 +865,7 @@ class SaveImagePanel private constructor(
         if (!thumbnailRequests.add(requestKey)) return
         runCatching {
             thumbnailExecutor.execute {
+                var published = false
                 try {
                     if (closed || generation != imageGeneration) return@execute
                     val drawable = runCatching { decodeEntry(entry, size) }
@@ -756,8 +884,21 @@ class SaveImagePanel private constructor(
                         Log.info("[ImageAnim] cache-store type=drawable generation=$generation key=$key")
                     }
                     publishThumbnail(key, drawable, bitmap, generation)
+                    published = true
                 } finally {
                     thumbnailRequests.remove(requestKey)
+                    // 首图解码失败或过期时不能让封面永远等下去：本代请求清空后补发封面。
+                    if (!published && !folderCoverGateOpen) {
+                        imageGrid?.post {
+                            if (
+                                !closed &&
+                                generation == imageGeneration &&
+                                thumbnailRequests.none { it.startsWith("$generation:") }
+                            ) {
+                                openFolderCoverGate()
+                            }
+                        }
+                    }
                 }
             }
         }.onFailure {
@@ -793,7 +934,19 @@ class SaveImagePanel private constructor(
             }
             if (!applied) Log.info("[ImageAnim] publish-no-target generation=$generation key=$key")
             if (!applied) requestThumbnailRefresh(grid, generation)
+            // 首张图已经贴到网格上，此时再补分类封面，避免封面解码抢在首图前面。
+            if (applied) openFolderCoverGate()
         }
+    }
+
+    /** 首图可见（或网格本来没有图片）后一次性提交挂起的分类封面请求。 */
+    private fun openFolderCoverGate() {
+        if (folderCoverGateOpen) return
+        folderCoverGateOpen = true
+        if (pendingFolderCovers.isEmpty()) return
+        val pending = pendingFolderCovers.toList()
+        pendingFolderCovers.clear()
+        pending.forEach { it() }
     }
 
     private fun requestThumbnailRefresh(grid: GridView, generation: Int) {
@@ -808,14 +961,39 @@ class SaveImagePanel private constructor(
         }
     }
 
+    /**
+     * 浏览模式首屏先解码网格首图，再补分类封面：封面解码与首图共用 SAF provider，
+     * 若同时排队会把首图解码挤到后面。封面请求先挂起，等首图真正贴到网格（或网格为空）后
+     * 按可见卡片一次性提交，不靠固定延时。
+     */
     private fun loadFolderCover(folder: ImageEntry, size: Int, image: ImageView) {
         val key = "folder:${folder.key}:$size"
         image.tag = key
         val target = WeakReference(image)
+        if (browseOnly && !folderCoverGateOpen) {
+            pendingFolderCovers += { submitFolderCover(folder, size, key, target) }
+            return
+        }
+        submitFolderCover(folder, size, key, target)
+    }
+
+    private fun submitFolderCover(
+        folder: ImageEntry,
+        size: Int,
+        key: String,
+        target: WeakReference<ImageView>,
+    ) {
+        // 已枚举分类（根/外部分组/首屏目标）直接取快照里按修改时间降序的最后一张，
+        // 等价于 coverFile 的“最早修改”封面；只有未枚举分类才回退实时枚举。
+        val snapped = currentScan?.imagesByFolder?.get(folder.key)?.lastOrNull()
         runCatching {
             folderCoverExecutor.execute {
                 if (closed) return@execute
-                val cover = runCatching { ImageFolderStore.coverFile(folder) }.getOrNull()
+                // 卡片可能已被回收给别的分类：先确认目标视图仍绑定本次封面再解码。
+                val currentView = target.get() ?: return@execute
+                if (currentView.tag != key) return@execute
+                val cover = snapped
+                    ?: runCatching { ImageFolderStore.coverFile(folder) }.getOrNull()
                     ?: return@execute
                 val coverKey = thumbnailKey(cover, size)
                 val cachedBitmap = synchronized(thumbnailCache) { thumbnailCache.get(coverKey) }
@@ -1497,7 +1675,7 @@ class SaveImagePanel private constructor(
 }
 
 private data class FolderSnapshot(
-    val folders: List<ImageEntry>,
+    val scan: FolderScan,
     val labels: Map<String, String>,
     val deletable: Set<String>,
     val lastKey: String?,

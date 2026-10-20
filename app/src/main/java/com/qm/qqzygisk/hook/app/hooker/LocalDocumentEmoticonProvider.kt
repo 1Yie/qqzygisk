@@ -44,6 +44,12 @@ private const val REFRESH_INTERVAL_MS = 2000L
 private const val ERROR_NOTIFY_INTERVAL_MS = 5000L
 
 /**
+ * 首张之后的生效最小发布间隔：下一次发布至少再准备这么多张。
+ * 配合倍增阈值，让累积发布的前缀快照总量保持 O(N)。
+ */
+private const val FIRST_LOAD_MIN_STEP = 16
+
+/**
  * 原生发送回调只能拿到 FavoriteEmoticonInfo.path。SAF 来源在这里通过
  * [ImageSendCache.sourceFor] 还原成原始文档身份后更新历史；无法映射的缓存路径直接忽略，
  * 缓存文件绝不能变成历史里的“表情”。
@@ -66,6 +72,14 @@ private val emoticonLoader = Executors.newSingleThreadExecutor { task ->
     Thread(task, "QQZygisk-EmoticonLoad").apply { isDaemon = true }
 }
 
+/**
+ * 分类图标单独排队：图标解析（含 SAF 封面复制）不能排在当前打开页面的图片准备前面，
+ * 否则首屏要等所有 tab 的图标都处理完。
+ */
+private val emoticonIconLoader = Executors.newSingleThreadExecutor { task ->
+    Thread(task, "QQZygisk-EmoticonIcon").apply { isDaemon = true }
+}
+
 private val mainHandler = Handler(Looper.getMainLooper())
 
 private fun submitLoad(task: () -> Unit) {
@@ -73,10 +87,22 @@ private fun submitLoad(task: () -> Unit) {
         .onFailure { Log.error("无法调度表情加载任务", it) }
 }
 
+private fun submitIconLoad(task: () -> Unit) {
+    runCatching { emoticonIconLoader.execute(task) }
+        .onFailure { Log.error("无法调度表情图标任务", it) }
+}
+
 private class BuiltEmoticons(
     val items: List<ExtraEmoticon>,
     val signature: String,
 )
+
+/** 一次分类构建的结果：成功、被 generation 取消，或宿主反射对象整体不可用。 */
+private sealed class EmoticonBuildResult {
+    class Ready(val built: BuiltEmoticons) : EmoticonBuildResult()
+    object Cancelled : EmoticonBuildResult()
+    class Unavailable(val error: Throwable) : EmoticonBuildResult()
+}
 
 private fun nativePathOf(entry: ImageEntry, onError: (Throwable) -> Unit): String? {
     entry.localFile?.let { return it.absolutePath }
@@ -89,12 +115,29 @@ private fun nativePathOf(entry: ImageEntry, onError: (Throwable) -> Unit): Strin
         .getOrNull()
 }
 
+/**
+ * 逐张准备原生需要的文件。首帧不必等整个分类：第一张成功后立即通过 [onProgress] 发布，
+ * 之后发布时间隔按“已准备前缀长度”倍增（至少再等 [FIRST_LOAD_MIN_STEP] 张），
+ * 使前缀快照与签名串的累计复制量为 O(N)，不会在大分类上产生 O(N²) 开销。
+ * 剩余条目继续处理，结束时统一发布完整快照。
+ * 刷新（已有快照）时 [onProgress] 为 null，新列表完整准备好才整体替换，绝不提前丢掉未准备的尾部。
+ *
+ * [isCancelled] 或 [onProgress] 返回 false 时返回 [EmoticonBuildResult.Cancelled]，调用方必须放弃本次结果。
+ * 反射对象整体不可用（类/构造器解析失败，或所有条目都无法创建）时返回
+ * [EmoticonBuildResult.Unavailable]：调用方必须保留旧快照，绝不能发布空列表（会被当成图片全部删除）。
+ * 单条目的创建/赋值异常按“跳过该条目”处理并报告，其余条目继续，最终发布实际成功的完整结果。
+ * [onError] 抛出的异常（授权被撤销）会中止本次构建，交由调用方保留旧快照。
+ */
 private fun buildEmoticonInfos(
     entries: List<ImageEntry>,
     groupId: String,
     onError: (Throwable) -> Unit,
-): BuiltEmoticons {
-    if (entries.isEmpty()) return BuiltEmoticons(emptyList(), "")
+    isCancelled: () -> Boolean,
+    onProgress: ((BuiltEmoticons) -> Boolean)?,
+): EmoticonBuildResult {
+    if (entries.isEmpty()) {
+        return EmoticonBuildResult.Ready(BuiltEmoticons(emptyList(), ""))
+    }
     val infoConstructor = runCatching {
         "com.tencent.mobileqq.emoticonview.FavoriteEmoticonInfo"
             .toAppClass()
@@ -102,14 +145,14 @@ private fun buildEmoticonInfos(
             .firstConstructor()
     }.getOrElse {
         Log.error("无法解析收藏表情类", it)
-        return BuiltEmoticons(emptyList(), "")
+        return EmoticonBuildResult.Unavailable(it)
     }
     val next = mutableListOf<ExtraEmoticon>()
     val signature = StringBuilder()
-    for (entry in entries) {
-        val path = nativePathOf(entry, onError) ?: continue
-        signature.append(entry.key).append('\u0001').append(path).append('\n')
-        next.add(
+    var constructionError: Throwable? = null
+    fun append(entry: ImageEntry) {
+        val path = nativePathOf(entry, onError) ?: return
+        val item = try {
             object : ExtraEmoticon() {
                 val info = infoConstructor.create()
                 init {
@@ -117,192 +160,357 @@ private fun buildEmoticonInfos(
                     info.set("actionData", "$groupId:${entry.key}")
                 }
                 override fun QQEmoticonObject(): Any = info
-            },
-        )
+            }
+        } catch (error: Throwable) {
+            // 单条目构造失败：与 nativePath 失败同语义，跳过它继续其余条目。
+            Log.error("创建表情对象失败: ${entry.key}", error)
+            if (constructionError == null) constructionError = error
+            onError(error)
+            return
+        }
+        signature.append(entry.key).append('\u0001').append(path).append('\n')
+        next.add(item)
     }
-    return BuiltEmoticons(next, signature.toString())
+    var index = 0
+    var nextPublishAt = 1
+    while (index < entries.size) {
+        if (isCancelled()) return EmoticonBuildResult.Cancelled
+        append(entries[index++])
+        if (
+            index < entries.size &&
+            onProgress != null &&
+            next.isNotEmpty() &&
+            next.size >= nextPublishAt
+        ) {
+            if (!onProgress(BuiltEmoticons(next.toList(), signature.toString()))) {
+                return EmoticonBuildResult.Cancelled
+            }
+            // 已发布前缀为 s 时，下一个阈值至少 s+16 且按 2 倍增长：
+            // 累计前缀复制量 ≤ 3N，避免每批都复制整个前缀。
+            nextPublishAt = maxOf(next.size * 2, next.size + FIRST_LOAD_MIN_STEP)
+        }
+    }
+    // 有条目却一个都创建不出：说明宿主对象整体不可用，保留旧快照而不是发布空列表。
+    constructionError?.let { error ->
+        if (next.isEmpty()) return EmoticonBuildResult.Unavailable(error)
+    }
+    return EmoticonBuildResult.Ready(BuiltEmoticons(next.toList(), signature.toString()))
 }
 
-class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
-    private inner class Panel(val entry: ImageEntry, val id: String) : ExtraEmoticonPanel() {
-        private val lock = Any()
-        private var snapshot: List<ExtraEmoticon> = emptyList()
-        private var signature = ""
-        private var loadedAt = 0L
-        private var loading = false
-        private var loadedOnce = false
-        private var published = false
-        private var iconPath: String? = null
-        private var iconLoading = false
+/**
+ * 单个面板的快照状态机，负责限流、generation 校验与发布。
+ * 所有方法都可能从主线程（读）或加载线程（写）调用。
+ */
+private class SnapshotLoader(
+    private val groupId: String,
+    private val notifyChanged: () -> Unit,
+    private val reportError: (Throwable) -> Unit,
+    private val currentGeneration: () -> Int,
+    private val submit: (() -> Unit) -> Unit,
+) {
+    private val lock = Any()
+    private var snapshot: List<ExtraEmoticon> = emptyList()
+    private var signature = ""
+    private var loadedAt = 0L
+    private var loading = false
+    private var loadedOnce = false
+    private var published = false
 
-        fun invalidate() {
-            synchronized(lock) { loadedAt = 0L }
+    val isReady: Boolean get() = synchronized(lock) { published }
+
+    fun invalidate() {
+        synchronized(lock) { loadedAt = 0L }
+    }
+
+    fun emoticons(load: () -> List<ImageEntry>): List<ExtraEmoticon> {
+        requestRefresh(load)
+        return synchronized(lock) { snapshot }
+    }
+
+    private fun requestRefresh(load: () -> List<ImageEntry>) {
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            if (loadedOnce && now - loadedAt < REFRESH_INTERVAL_MS) return
+            if (loading) return
+            loading = true
         }
+        submit { refresh(load) }
+    }
 
-        override fun isSnapshotReady(): Boolean = synchronized(lock) { published }
-
-        override fun emoticons(): List<ExtraEmoticon> {
-            requestRefresh()
-            return synchronized(lock) { snapshot }
-        }
-
-        override fun emoticonPanelIconURL(): String? {
-            synchronized(lock) { iconPath?.takeIf { File(it).isFile } }?.let { return "file://$it" }
-            requestIcon()
-            return synchronized(lock) {
-                iconPath?.takeIf { File(it).isFile }?.let { "file://$it" }
-            }
-        }
-
-        override fun uniqueId(): String = id
-
-        private fun requestRefresh() {
-            val now = System.currentTimeMillis()
+    private fun refresh(load: () -> List<ImageEntry>) {
+        val generation = currentGeneration()
+        val entries = try {
+            load()
+        } catch (error: Throwable) {
             synchronized(lock) {
-                if (loadedOnce && now - loadedAt < REFRESH_INTERVAL_MS) return
-                if (loading) return
-                loading = true
+                loading = false
+                loadedAt = System.currentTimeMillis()
+                loadedOnce = true
             }
-            submitLoad { refresh() }
+            reportError(error)
+            return
         }
-
-        private fun refresh() {
-            val generation = providerGeneration
-            val entries = runCatching { ImageFolderStore.images(entry) }.getOrElse { error ->
+        val progressive = synchronized(lock) { !published }
+        val onProgress: ((BuiltEmoticons) -> Boolean)? = if (progressive) {
+            { partial -> publishPartial(partial, generation) }
+        } else {
+            null
+        }
+        val result = try {
+            buildEmoticonInfos(
+                entries = entries,
+                groupId = groupId,
+                onError = { error ->
+                    // 授权在构建途中失效：中止本次构建，不能把读不到当成图片被删除。
+                    if (error is ImageAccessException) throw error
+                    reportError(error)
+                },
+                isCancelled = { generation != currentGeneration() },
+                onProgress = onProgress,
+            )
+        } catch (error: Throwable) {
+            synchronized(lock) {
+                loading = false
+                loadedAt = System.currentTimeMillis()
+                loadedOnce = true
+            }
+            reportError(error)
+            return
+        }
+        when (result) {
+            EmoticonBuildResult.Cancelled -> {
+                // generation 已变化：丢弃结果并允许下次查询立即重算。
+                synchronized(lock) {
+                    loading = false
+                    loadedAt = 0L
+                }
+                notifyChanged()
+            }
+            is EmoticonBuildResult.Unavailable -> {
+                // 宿主类不可用：保留上一份快照（没有快照就继续 not ready），
+                // 绝不能把空列表发布成“图片被删除”。
                 synchronized(lock) {
                     loading = false
                     loadedAt = System.currentTimeMillis()
                     loadedOnce = true
                 }
-                reportAccessError(error)
-                return
             }
-            val built = buildEmoticonInfos(entries, id) { reportAccessError(it) }
-            val icon = runCatching { resolveIconPath() }.getOrNull()
-            if (generation != providerGeneration) {
-                // 期间目录被改写：丢弃旧结果，下次查询立即重算。
-                synchronized(lock) {
-                    loading = false
-                    loadedAt = 0L
-                }
-                return
+            is EmoticonBuildResult.Ready -> finish(result.built, generation)
+        }
+    }
+
+    /** 首批增量发布：只在 generation 未变化时替换前缀快照，不设置完成标记。 */
+    private fun publishPartial(built: BuiltEmoticons, generation: Int): Boolean {
+        var changed = false
+        synchronized(lock) {
+            if (generation != currentGeneration()) return false
+            if (built.signature != signature) {
+                signature = built.signature
+                snapshot = built.items
+                changed = true
             }
-            var changed = false
-            synchronized(lock) {
+            published = true
+        }
+        if (changed) notifyChanged()
+        return true
+    }
+
+    private fun finish(built: BuiltEmoticons, generation: Int) {
+        var changed = false
+        var cancelled = false
+        synchronized(lock) {
+            if (generation != currentGeneration()) {
+                loading = false
+                loadedAt = 0L
+                cancelled = true
+            } else {
                 if (built.signature != signature) {
                     signature = built.signature
                     snapshot = built.items
                     changed = true
                 }
-                if (icon != null && icon != iconPath) {
-                    iconPath = icon
-                    changed = true
-                }
+                published = true
                 loadedAt = System.currentTimeMillis()
                 loadedOnce = true
-                published = true
                 loading = false
             }
-            if (changed) notifyRefreshed()
+        }
+        if (cancelled) {
+            notifyChanged()
+            return
+        }
+        if (changed) notifyChanged()
+    }
+}
+
+class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
+    private inner class Panel(
+        private val entry: ImageEntry,
+        private val panelId: String,
+        initialImages: List<ImageEntry>,
+        scanGeneration: Int,
+    ) : ExtraEmoticonPanel() {
+        private val stateLock = Any()
+        private var iconPath: String? = null
+        private var iconResolved = false
+        private var iconGeneration = -1
+
+        /** 分类扫描时已枚举的图片；首次打开面板直接复用，避免再列一次目录。 */
+        private var pendingImages: List<ImageEntry>? = initialImages
+        private var pendingGeneration: Int = scanGeneration
+        private var knownImages: List<ImageEntry> = initialImages
+
+        private val content = SnapshotLoader(
+            groupId = panelId,
+            notifyChanged = { notifyRefreshed() },
+            reportError = { error -> reportAccessError(error) },
+            currentGeneration = { providerGeneration },
+            submit = { task -> submitLoad(task) },
+        )
+
+        fun invalidate() {
+            content.invalidate()
+            // 目录可能被改写（含新增/替换 __cover__）：允许下一次请求重新解析图标，
+            // 同时保留旧路径继续显示，避免 tab 闪烁。
+            synchronized(stateLock) { iconResolved = false }
+        }
+
+        /** 首次加载前用同一代的新扫描结果替换首帧快照；封面候选变化时失效已解析图标。 */
+        fun updatePending(images: List<ImageEntry>, generation: Int) {
+            var iconInvalidated = false
+            synchronized(stateLock) {
+                // 过期代的扫描结果不允许覆盖当前候选。
+                if (generation != providerGeneration) return
+                iconInvalidated = applyImagesLocked(images)
+                if (pendingImages != null) {
+                    pendingImages = images
+                    pendingGeneration = generation
+                }
+            }
+            if (iconInvalidated) notifyRefreshed()
+        }
+
+        /** 记录当前图片列表，返回封面候选是否发生变化（变化后需重解析一次图标）。 */
+        private fun applyImagesLocked(images: List<ImageEntry>): Boolean {
+            val previous = knownImages.minByOrNull { it.modified }?.key
+            val next = images.minByOrNull { it.modified }?.key
+            knownImages = images
+            if (previous == next) return false
+            iconResolved = false
+            // 分类已无图片：旧封面不能再继续显示。
+            if (next == null) iconPath = null
+            return true
+        }
+
+        fun folderKey(): String = entry.key
+
+        override fun isSnapshotReady(): Boolean = content.isReady
+
+        override fun emoticons(): List<ExtraEmoticon> = content.emoticons { loadEntries() }
+
+        override fun emoticonPanelIconURL(): String? {
+            // 先按 iconResolved/代状态决定是否重解析（requestIcon 内部去重），
+            // 再返回旧缓存；新图标完成会触发刷新，旧图标不会挡住替换。
+            requestIcon()
+            return synchronized(stateLock) { iconPath }?.takeIf { File(it).isFile }?.let { "file://$it" }
+        }
+
+        override fun uniqueId(): String = panelId
+
+        private fun loadEntries(): List<ImageEntry> {
+            val pending = synchronized(stateLock) {
+                val cached = pendingImages
+                pendingImages = null
+                // 扫描快照只在同一代有效；generation 已变化时重新枚举，避免发布过期列表。
+                cached?.takeIf { pendingGeneration == providerGeneration }
+            }
+            val entries = pending ?: ImageFolderStore.images(entry)
+            val iconInvalidated = synchronized(stateLock) { applyImagesLocked(entries) }
+            if (iconInvalidated) notifyRefreshed()
+            return entries
         }
 
         private fun requestIcon() {
-            synchronized(lock) {
-                if (iconLoading) return
-                iconLoading = true
+            var generation = providerGeneration
+            synchronized(stateLock) {
+                generation = providerGeneration
+                // 同一代内已解析才去重；失效后（iconResolved=false 或代已变化）必须重解析，
+                // 否则新增/替换的封面永远不会生效。
+                if (iconResolved && iconGeneration == generation) {
+                    val existing = iconPath
+                    if (existing == null || File(existing).isFile) return
+                    // 缓存文件已被清理，允许重新解析。
+                    iconPath = null
+                }
+                iconResolved = true
+                iconGeneration = generation
             }
-            submitLoad {
-                val icon = runCatching { resolveIconPath() }.getOrNull()
+            submitIconLoad {
+                val icon = runCatching { resolveIconPath() }.getOrElse { error ->
+                    synchronized(stateLock) {
+                        // 只撤销本次请求自己的标记，不能踩掉更新代的请求。
+                        if (iconGeneration == generation) iconResolved = false
+                    }
+                    if (error is ImageAccessException) reportAccessError(error)
+                    else Log.warn("解析表情分类图标失败: ${entry.key}", error)
+                    return@submitIconLoad
+                }
+                if (generation != providerGeneration) {
+                    synchronized(stateLock) {
+                        if (iconGeneration == generation) iconResolved = false
+                    }
+                    return@submitIconLoad
+                }
                 var changed = false
-                synchronized(lock) {
+                synchronized(stateLock) {
                     if (icon != null && icon != iconPath) {
                         iconPath = icon
                         changed = true
                     }
-                    iconLoading = false
                 }
                 if (changed) notifyRefreshed()
             }
         }
 
+        /**
+         * 一次枚举同时决定图标：先找 `__cover__.` 覆盖文件，否则使用分类扫描已得到的
+         * 图片列表（等价于旧 coverFile/images 的最低 modified 项），不再重复列目录。
+         */
         private fun resolveIconPath(): String? {
-            val namedCover = runCatching {
-                entry.children().firstOrNull {
-                    it.isFile && it.name.startsWith("__cover__.")
-                }
-            }.getOrNull()
-            val target = namedCover
-                ?: runCatching { ImageFolderStore.coverFile(entry) }.getOrNull()
-                ?: runCatching { ImageFolderStore.images(entry).firstOrNull() }.getOrNull()
-            return target?.let { nativePathOf(it) { error -> reportAccessError(error) } }
+            val namedCover = try {
+                entry.children().firstOrNull { it.isFile && it.name.startsWith("__cover__.") }
+            } catch (error: Throwable) {
+                if (error is ImageAccessException) throw error
+                Log.warn("枚举分类封面失败: ${entry.key}", error)
+                null
+            }
+            val fallback = synchronized(stateLock) { knownImages }.minByOrNull { it.modified }
+            val target = namedCover ?: fallback ?: return null
+            return nativePathOf(target) { error ->
+                if (error is ImageAccessException) throw error
+                reportAccessError(error)
+            }
         }
     }
 
     private inner class HistoryPanel : ExtraEmoticonPanel() {
-        private val lock = Any()
-        private var snapshot: List<ExtraEmoticon> = emptyList()
-        private var signature = ""
-        private var loadedAt = 0L
-        private var loading = false
-        private var loadedOnce = false
-        private var published = false
+        private val content = SnapshotLoader(
+            groupId = ImageFolderStore.HISTORY_DIR_NAME,
+            notifyChanged = { notifyRefreshed() },
+            reportError = { error -> reportAccessError(error) },
+            currentGeneration = { providerGeneration },
+            submit = { task -> submitLoad(task) },
+        )
 
         override fun uniqueId(): String = ImageFolderStore.HISTORY_DIR_NAME
 
-        override fun isSnapshotReady(): Boolean = synchronized(lock) { published }
+        override fun isSnapshotReady(): Boolean = content.isReady
 
-        override fun emoticons(): List<ExtraEmoticon> {
-            requestRefresh()
-            return synchronized(lock) { snapshot }
+        override fun emoticons(): List<ExtraEmoticon> = content.emoticons {
+            ImageFolderStore.images(ImageFolderStore.historyFolder())
         }
 
         override fun emoticonPanelIconURL(): String? = null
-
-        private fun requestRefresh() {
-            val now = System.currentTimeMillis()
-            synchronized(lock) {
-                if (loadedOnce && now - loadedAt < REFRESH_INTERVAL_MS) return
-                if (loading) return
-                loading = true
-            }
-            submitLoad { refresh() }
-        }
-
-        private fun refresh() {
-            val generation = providerGeneration
-            val entries = runCatching {
-                ImageFolderStore.images(ImageFolderStore.historyFolder())
-            }.getOrElse { error ->
-                synchronized(lock) {
-                    loading = false
-                    loadedAt = System.currentTimeMillis()
-                    loadedOnce = true
-                }
-                reportAccessError(error)
-                return
-            }
-            val built = buildEmoticonInfos(entries, uniqueId()) { reportAccessError(it) }
-            if (generation != providerGeneration) {
-                synchronized(lock) {
-                    loading = false
-                    loadedAt = 0L
-                }
-                return
-            }
-            var changed = false
-            synchronized(lock) {
-                if (built.signature != signature) {
-                    signature = built.signature
-                    snapshot = built.items
-                    changed = true
-                }
-                loadedAt = System.currentTimeMillis()
-                loadedOnce = true
-                published = true
-                loading = false
-            }
-            if (changed) notifyRefreshed()
-        }
     }
 
     private val panelsMap = ConcurrentHashMap<String, Panel>()
@@ -392,7 +600,7 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
 
     private fun refreshPanels() {
         val generation = providerGeneration
-        val result = runCatching { buildPanels() }
+        val result = runCatching { buildPanels(generation) }
         if (generation != providerGeneration) {
             synchronized(panelsLock) {
                 panelsLoading = false
@@ -410,7 +618,7 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
             return
         }
         val signature = panels.filterIsInstance<Panel>()
-            .joinToString("\n") { it.entry.key }
+            .joinToString("\n") { it.folderKey() }
         var changed = false
         synchronized(panelsLock) {
             if (signature != panelsSignature || !panelsPublished) {
@@ -426,38 +634,41 @@ class LocalDocumentEmoticonProvider : ExtraEmoticonProvider() {
         if (changed) notifyRefreshed()
     }
 
-    private fun buildPanels(): List<ExtraEmoticonPanel> {
-        val panels = mutableListOf<ExtraEmoticonPanel>()
+    private fun buildPanels(generation: Int): List<ExtraEmoticonPanel> {
+        val panels = mutableListOf<Pair<ExtraEmoticonPanel, ImageEntry>>()
         val seen = mutableSetOf<String>()
-        // 授权根或已配置来源失效时这里会抛 ImageAccessException，由刷新任务明确提示，绝不缓存成空列表。
-        for (folder in ImageFolderStore.folders(includeExternal = true)) {
+        // 一次扫描同时给出分类与各分类的图片；存在性判断复用这份快照，
+        // 后续打开面板不再重复列目录。授权根或已配置来源失效时这里会抛
+        // ImageAccessException，由刷新任务明确提示，绝不缓存成空列表。
+        val scan = ImageFolderStore.scanFolders(includeExternal = true)
+        for (folder in scan.folders) {
             if (ImageFolderStore.isHistoryFolder(folder)) continue
             if (!folder.isDirectory) continue
             val key = folder.key
             if (!seen.add(key)) continue
             val existing = panelsMap[key]
             if (existing != null) {
-                panels.add(existing)
+                // 尚未打开的首次加载快照跟随本次扫描换代；已加载的面板不受影响。
+                scan.imagesByFolder[key]?.let { existing.updatePending(it, generation) }
+                panels.add(existing to folder)
                 continue
             }
-            val images = runCatching { ImageFolderStore.images(folder) }
+            // 扫描未覆盖的目录（如历史占位、扫描后被删掉的目录）才回退到实时枚举。
+            val images = scan.imagesByFolder[key]?.let { Result.success(it) }
+                ?: runCatching { ImageFolderStore.images(folder) }
             if (images.isFailure) {
-                // 目录暂时不可读：保留上次发布的面板（含陈旧快照），并明确提示重新授权，
-                // 不能把错误当成“分类被删除”。
                 images.exceptionOrNull()?.let { error -> reportAccessError(error) }
-                panelsMap[key]?.let { panels.add(it) }
                 continue
             }
             val available = images.getOrDefault(emptyList())
             if (available.isEmpty()) continue
-            val panel = Panel(folder, folder.name)
+            val panel = Panel(folder, folder.name, available, generation)
             panelsMap[key] = panel
-            panels.add(panel)
+            panels.add(panel to folder)
         }
-        val sorted = panels.sortedByDescending { panel ->
-            val entry = (panel as? Panel)?.entry ?: return@sortedByDescending 0
-            runCatching { ImageFolderStore.folderUsage(entry) }.getOrDefault(0)
-        }
+        val sorted = panels.sortedByDescending { (_, folder) ->
+            runCatching { ImageFolderStore.folderUsage(folder) }.getOrDefault(0)
+        }.map { (panel, _) -> panel }
         return listOf(historyPanel) + sorted
     }
 

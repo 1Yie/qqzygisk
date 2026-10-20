@@ -100,7 +100,9 @@ internal object ImageFolderStore {
         val source = ROOT_PATH
         if (ImageEntry.isDocumentSource(source)) {
             val entry = ImageEntry.from(source)
-            if (!entry.exists()) throw ImageAccessException("图片目录不可用，请重新选择授权目录")
+            // from() 已经校验持久读授权并查询过文档状态：不能再 exists()，否则每次取根都会
+            // 多扫一遍持久授权并多查一次 provider。状态表明不是有效目录时仍明确拒绝。
+            if (!entry.isDirectory) throw ImageAccessException("图片目录不可用，请重新选择授权目录")
             return entry
         }
         val directory = File(source)
@@ -129,8 +131,9 @@ internal object ImageFolderStore {
         return false
     }
 
-    fun historyFolder(): ImageEntry {
-        val root = root()
+    fun historyFolder(): ImageEntry = historyFolder(root())
+
+    private fun historyFolder(root: ImageEntry): ImageEntry {
         val key = root.localFile?.let { File(it, HISTORY_DIR_NAME).absolutePath }
             ?: (root.key + HISTORY_KEY_SUFFIX)
         return ImageEntry.virtual(key, HISTORY_DIR_NAME)
@@ -145,13 +148,24 @@ internal object ImageFolderStore {
     private fun isHistoryKey(key: String): Boolean =
         key.endsWith(HISTORY_KEY_SUFFIX) || key.substringAfterLast('/') == HISTORY_DIR_NAME
 
-    fun folders(includeExternal: Boolean = false): List<ImageEntry> {
+    /**
+     * 枚举分类快照，供面板/表情面板一次绑定首屏。
+     *
+     * 根只解析一次，且只枚举“分类发现/外部可读过滤”真正需要的目录：授权根自身与外部来源
+     * 及其分组。自有子分类只保留根枚举得到的元数据，不提前 children()，避免把每个分类的
+     * 全部文件压回首屏屏障；分类集合与顺序和旧的 folders() 完全一致。
+     */
+    fun scanFolders(includeExternal: Boolean = false): FolderScan {
         val root = root()
         val rootChildren = root.children()
-        val owned = buildList<ImageEntry> {
-            // 选中的目录本身也可能直接放图片（没有子分类）；必须作为不可删除的分类出现。
-            if (rootChildren.any(::isReadableImage)) add(root)
-            rootChildren.filterTo(this) { it.isDirectory && it.name != HISTORY_DIR_NAME && !it.name.startsWith(".") }
+        val imagesByFolder = LinkedHashMap<String, List<ImageEntry>>()
+        val owned = mutableListOf<ImageEntry>()
+        // 选中的目录本身也可能直接放图片（没有子分类）；必须作为不可删除的分类出现。
+        // 它和分类共用同一批 children：一次判断可读性，一次取图片列表。
+        if (rootChildren.any(::isReadableImage)) owned += root
+        imagesByFolder[root.key] = sortedImages(rootChildren)
+        rootChildren.filterTo(owned) {
+            it.isDirectory && it.name != HISTORY_DIR_NAME && !it.name.startsWith(".")
         }
         val extra = if (includeExternal) {
             SCAN_ROOTS.asSequence()
@@ -160,14 +174,26 @@ internal object ImageFolderStore {
                 .flatMap { source ->
                     val children = source.children()
                     val result = mutableListOf<ImageEntry>()
-                    if (children.any(::isReadableImage)) result += source
+                    if (children.any(::isReadableImage)) {
+                        result += source
+                        imagesByFolder[source.key] = sortedImages(children)
+                    }
                     // 外部目录里没有可读图片的分组不展示：系统可能放行列目录、却拒绝读文件，
                     // 过滤掉这些分组，避免出现一排点进去全空、切换还卡顿的分类。
-                    children.filterTo(result) { child ->
-                        child.isDirectory &&
-                            child.name != HISTORY_DIR_NAME &&
-                            !child.name.startsWith(".") &&
-                            hasReadableImage(child)
+                    // 这里枚举到的 children 同时就是该分组的图片列表，不再二次枚举。
+                    for (child in children) {
+                        if (
+                            !child.isDirectory ||
+                            child.name == HISTORY_DIR_NAME ||
+                            child.name.startsWith(".")
+                        ) {
+                            continue
+                        }
+                        val childEntries = child.children()
+                        if (childEntries.any(::isReadableImage)) {
+                            result += child
+                            imagesByFolder[child.key] = sortedImages(childEntries)
+                        }
                     }
                     result.asSequence()
                 }
@@ -185,7 +211,8 @@ internal object ImageFolderStore {
         if (isWeChat) {
             Log.info("微信目录扫描: root=$ROOT_PATH 自有分类=${owned.size} 外部分类=${extra.size}")
         }
-        return if (includeExternal) listOf(historyFolder()) + real else real
+        val folders = if (includeExternal) listOf(historyFolder(root)) + real else real
+        return FolderScan(root = root, folders = folders, imagesByFolder = imagesByFolder)
     }
 
     /** 外部来源只在缺失时跳过；已配置的 URI 授权失效仍然明确抛出。 */
@@ -197,10 +224,13 @@ internal object ImageFolderStore {
     fun images(folder: ImageEntry): List<ImageEntry> {
         if (isHistoryFolder(folder)) return historyImages()
         if (!folder.isDirectory) return emptyList()
-        return folder.children()
+        return sortedImages(folder.children())
+    }
+
+    private fun sortedImages(children: List<ImageEntry>): List<ImageEntry> =
+        children
             .filter { it.isFile && isImageEntry(it) }
             .sortedByDescending { it.modified }
-    }
 
     fun coverFile(folder: ImageEntry): ImageEntry? {
         if (isHistoryFolder(folder)) return historyImages().firstOrNull()
@@ -240,8 +270,8 @@ internal object ImageFolderStore {
         }
     }
 
-    fun lastFolderFrom(available: List<ImageEntry>): ImageEntry? {
-        val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank { readLastFolderMarker() }
+    fun lastFolderFrom(available: List<ImageEntry>, root: ImageEntry = root()): ImageEntry? {
+        val saved = HookSettings.getString(LAST_FOLDER_KEY, "").ifBlank { readLastFolderMarker(root) }
         if (saved.isEmpty()) {
             // 没有记录时优先真实分类：扁平授权目录只有一个根分类，不能默认落在空的历史页。
             return available.firstOrNull { !isHistoryFolder(it) } ?: available.firstOrNull()
@@ -251,23 +281,15 @@ internal object ImageFolderStore {
             ?: available.firstOrNull()
     }
 
-    private fun readLastFolderMarker(): String = runCatching {
-        root().findChild(LAST_FOLDER_FILE)
+    /** 沿用调用方刚解析过的授权根，避免为了读旧标记再解析一次根。 */
+    private fun readLastFolderMarker(root: ImageEntry): String = runCatching {
+        root.findChild(LAST_FOLDER_FILE)
             ?.takeIf { it.isFile }
             ?.inputStream()
             ?.bufferedReader()
             ?.use { it.readText() }
             ?.trim()
     }.getOrNull().orEmpty()
-
-    /**
-     * 目录里是否存在**真的能打开**的图片。
-     *
-     * 只判断可读标志不够：跨应用访问 `Android/media/<其它包>` 时系统可能放行列目录、
-     * 却拒绝读文件，必须真开一次流才能确认，否则会出现一排点进去全空的分类。
-     */
-    private fun hasReadableImage(folder: ImageEntry): Boolean =
-        folder.children().any(::isReadableImage)
 
     /** 真的能打开一次流才算可读：跨应用目录可能列得出文件却拒绝读取。 */
     private fun isReadableImage(entry: ImageEntry): Boolean {
@@ -933,4 +955,42 @@ internal object ImageFolderStore {
         val length: Long = Long.MIN_VALUE,
         val names: Map<String, String> = emptyMap(),
     )
+}
+
+/**
+ * [ImageFolderStore.scanFolders] 一次加载得到的分类快照。
+ *
+ * [imagesByFolder] 只包含本次扫描真正枚举过的目录（授权根、外部可读分组，以及调用方用
+ * [withImagesFor] 刚枚举过的分类），值遵循 [ImageFolderStore.images] 的筛选与排序；
+ * 消费者未命中时应调用 [ImageFolderStore.images] 重新读取。
+ * 这只是单次加载快照：不能用来绕过后续的读取/解码/删除授权校验。
+ */
+internal data class FolderScan(
+    val root: ImageEntry,
+    val folders: List<ImageEntry>,
+    val imagesByFolder: Map<String, List<ImageEntry>>,
+) {
+    /**
+     * 把刚刚真正枚举过的分类图片补进快照，供首屏直接绑定。
+     *
+     * 只应在完成一次真实枚举后调用，不能用来伪装“已扫描”；已存在的分类原样返回。
+     */
+    fun withImagesFor(folder: ImageEntry): FolderScan {
+        if (imagesByFolder.containsKey(folder.key)) return this
+        val images = ImageFolderStore.images(folder)
+        return copy(imagesByFolder = imagesByFolder + (folder.key to images))
+    }
+
+    /**
+     * 用本次快照判断分类的可删除性，避免每个分类都重新解析授权根。
+     *
+     * 分类必须是授权根的直接子目录，且 provider 声明支持删除；真正删除时
+     * [ImageFolderStore.deleteFolder] 仍会按当前 provider 状态重新校验授权。
+     */
+    fun canDelete(folder: ImageEntry): Boolean =
+        folder.isDirectory &&
+            !ImageFolderStore.isHistoryFolder(folder) &&
+            folder.key != root.key &&
+            folder.parentKey == root.key &&
+            folder.canDelete
 }

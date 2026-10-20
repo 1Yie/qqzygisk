@@ -203,11 +203,11 @@ class SafDirectoryFlowTest {
         assertFalse("授权根自身绝不允许删除", ImageFolderStore.canDelete(root))
 
         // Flat selected tree is itself a browsable category (no subfolder required).
-        val ownedCategories = ImageFolderStore.folders(includeExternal = false)
+        val ownedCategories = ImageFolderStore.scanFolders(includeExternal = false).folders
         val rootCategory = ownedCategories.firstOrNull { it.key == root.key }
         assertTrue("扁平授权根必须作为分类出现", rootCategory != null)
         assertFalse("授权根分类绝不允许删除", ImageFolderStore.canDelete(rootCategory!!))
-        val browsableCategories = ImageFolderStore.folders(includeExternal = true)
+        val browsableCategories = ImageFolderStore.scanFolders(includeExternal = true).folders
         assertTrue("带外部来源的分类列表必须包含授权根", browsableCategories.any { it.key == root.key })
         assertEquals(
             "没有保存上次分类时应默认选中扁平授权根",
@@ -321,7 +321,7 @@ class SafDirectoryFlowTest {
         assertTrue(ImageFolderStore.canDelete(category))
         ImageFolderStore.deleteFolder(category)
         assertNull("空分类应被删除", root.findChild("测试分类"))
-        assertFalse(ImageFolderStore.folders().any { it.key == category.key })
+        assertFalse(ImageFolderStore.scanFolders().folders.any { it.key == category.key })
 
         // FunBox migration containment: destination nested inside the source tree.
         val nested = ImageFolderStore.createFolder("nested-destination")
@@ -604,11 +604,11 @@ class SafDirectoryFlowTest {
         assertFalse("只读 provider 根即使收到写 URI flag 也不可写", root.canWrite)
         assertFalse(root.canDelete)
 
-        val ownedCategories = ImageFolderStore.folders(includeExternal = false)
+        val ownedCategories = ImageFolderStore.scanFolders(includeExternal = false).folders
         val rootCategory = ownedCategories.firstOrNull { it.key == root.key }
         assertTrue("只读扁平授权根必须作为分类出现", rootCategory != null)
         assertFalse("授权根分类绝不允许删除", ImageFolderStore.canDelete(rootCategory!!))
-        val browsableCategories = ImageFolderStore.folders(includeExternal = true)
+        val browsableCategories = ImageFolderStore.scanFolders(includeExternal = true).folders
         assertTrue(browsableCategories.any { it.key == root.key })
         assertEquals(
             "没有保存上次分类时应默认选中只读授权根",
